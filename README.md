@@ -1,4 +1,4 @@
-# 🕷️ Anansi
+!https://repository-images.githubusercontent.com/1238896536/d711cc76-8358-4a4a-9160-341131498877
 
 > *The spider that learns.*
 
