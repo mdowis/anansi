@@ -1,4 +1,4 @@
-"""CLI entry-point for Arachne."""
+"""CLI entry-point for Anansi."""
 
 from __future__ import annotations
 
