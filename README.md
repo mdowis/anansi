@@ -36,7 +36,7 @@ Also includes: JS interaction (click, fill, scroll, wait), robots.txt compliance
 ## Install
 
 ```bash
-pip install git+https://github.com/mdowis/adaptive-web-scraper.git@claude/adaptive-scraper-framework-N7SSd
+pip install git+https://github.com/mdowis/anansi
 
 # For browser-based fetching (Cloudflare bypass, JS rendering):
 playwright install chromium
