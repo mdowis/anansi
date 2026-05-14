@@ -989,7 +989,9 @@ async def crawl_metrics(crawl_id: str) -> dict[str, Any]:
         try:
             import datetime
             created = datetime.datetime.fromisoformat(info["created_at"])
-            elapsed = (datetime.datetime.utcnow() - created).total_seconds()
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=datetime.timezone.utc)
+            elapsed = (datetime.datetime.now(tz=datetime.timezone.utc) - created).total_seconds()
             if elapsed > 0 and visited > 0:
                 pages_per_second = round(visited / elapsed, 3)
         except Exception:
