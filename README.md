@@ -18,7 +18,7 @@ The result: a crawler that handles hostile sites, survives redesigns, and gets b
 |---|---|
 | **Self-healing parser** | CSS selectors are stored with confidence scores. When one breaks, four healing strategies run — fuzzy class matching, text-pattern regex, structural context, XPath fallback — and the winner is persisted for next time. |
 | **Structured data extraction** | JSON-LD, Open Graph, and Microdata are extracted from every page automatically. Fields matched in schema.org markup skip CSS evaluation entirely — they're more stable and require no selector maintenance. |
-| **TLS fingerprint mimicry** | Enterprise bot-detection (Cloudflare, Akamai, DataDome) fingerprints your TLS ClientHello before inspecting a single header. With `impersonate="chrome124"`, Anansi uses curl-cffi to produce a byte-for-byte copy of Chrome's TLS handshake. Install the `tls` extra (see [Install](#install)). |
+| **TLS / HTTP-2 fingerprint mimicry** | Enterprise bot-detection (Cloudflare, Akamai, DataDome) fingerprints your TLS ClientHello *and* HTTP/2 SETTINGS/frame ordering before inspecting a single header. With `impersonate="chrome124"`, Anansi uses curl-cffi to reproduce both, plus per-host session warm-up and a graduated Akamai-block escalation ladder. Install the `tls` extra (see [Install](#install)); operator-gated, authorized use only. |
 | **Auto browser upgrade** | Every HTTP response is checked for SPA markers, noscript redirects, and suspiciously low text density. JS shells trigger a silent retry with a stealth Playwright browser. The decision is cached per domain for the crawl session. |
 | **Anti-bot & Cloudflare bypass** | The browser fetcher removes `webdriver` fingerprints, spoofs plugins and hardware concurrency, adds canvas/WebGL noise, and waits out Cloudflare Turnstile challenges automatically. |
 | **Adaptive rate limiting** | A per-domain sliding window tracks error rates. A 429 immediately doubles the request gap and activates a circuit breaker. Sustained 5xx errors increase the gap further. Clean windows slowly decay back toward the base delay. |
@@ -494,7 +494,32 @@ by an MCP/LLM client — only by whoever runs the server:
 | Variable | Default | Effect when set to `1`/`true` |
 |---|---|---|
 | `ANANSI_ALLOW_PRIVATE_NETWORKS` | off | Allows fetches/crawls to resolve to loopback, RFC1918, link-local, and cloud-metadata addresses. Off by default so the untrusted LLM cannot reach internal services (SSRF). Enable only on a trusted, isolated host. |
-| `ANANSI_DISABLE_ANTIBOT` | off | Disables stealth-JS injection and the Cloudflare-challenge wait in the browser fetcher, and makes the HTTP fetcher ignore `impersonate=` (warns and falls back to plain httpx). Use for a compliance-conscious deployment that must not perform anti-bot evasion. |
+| `ANANSI_DISABLE_ANTIBOT` | off | Disables **all** anti-bot evasion: stealth-JS injection, the Cloudflare-challenge wait, curl-cffi TLS/HTTP-2 impersonation, the per-host session warm-up, the browser→HTTP cookie hand-off, and the Akamai escalation ladder. Block *detection* still runs so callers get an honest blocked status. Always wins over `ANANSI_IMPERSONATE`. |
+| `ANANSI_IMPERSONATE` | unset | Default curl-cffi TLS/HTTP-2 impersonation target applied to HTTP fetches (e.g. `chrome124`). Must be an allowlisted target; an invalid value fails loud at startup. A per-call `impersonate=` argument (also allowlist-validated) overrides it. |
+
+#### Surviving Akamai / edge bot-managers (authorized use)
+
+Akamai Bot Manager blocks via TLS JA3/JA4 fingerprint, HTTP/2 frame-ordering
+fingerprint, and behavioral scoring of cold (cookie-less, no-`Referer`)
+requests — block pages show `Reference #…` / `errors.edgesuite.net` and a
+`Server: AkamaiGHost` header. Recommended operator recipe:
+
+1. Install the `tls` extra and set `ANANSI_IMPERSONATE=chrome124` (replays a
+   real Chrome TLS **and** HTTP/2 fingerprint — the single biggest lever).
+2. Leave the per-host session warm-up and `Referer` continuity on (default)
+   so behavioral scoring sees a warm session.
+3. Supply **residential or mobile** proxies via the existing proxy support
+   for the hardest tier — datacenter IPs are heavily penalized.
+4. Allow browser escalation (`use_browser` / the automatic ladder) so the
+   Akamai sensor JS can run when impersonation alone is insufficient.
+
+**Honest limit:** the highest Akamai tier validates `_abck` via sensor JS and
+also blocks headless Chromium. Even with impersonation + browser + warm-up it
+may remain unreliable without residential/mobile egress, and sometimes even
+then. Anansi makes a best effort and reports an honest blocked status when it
+cannot get through. These features are for **authorized** scraping only — see
+[`DISCLAIMER.md`](DISCLAIMER.md); `ANANSI_DISABLE_ANTIBOT=1` turns all of it
+off.
 
 ---
 

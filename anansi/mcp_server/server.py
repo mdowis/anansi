@@ -347,6 +347,34 @@ async def _fetch_one(
             ) as fetcher:
                 result = await fetcher.fetch(url, proxy=proxy, timeout=timeout)
 
+            # Graduated Akamai escalation: impersonated retry → browser.
+            # Detection still runs under DISABLE_ANTIBOT (honest status) but
+            # does not escalate.
+            from anansi.fetchers.escalate import (
+                DEFAULT_IMPERSONATE,
+                escalate_akamai,
+            )
+
+            async def _retry_impersonated() -> Any:
+                target = impersonate or security.IMPERSONATE_DEFAULT or DEFAULT_IMPERSONATE
+                async with HTTPFetcher(
+                    timeout=timeout, impersonate=target
+                ) as f2:
+                    return await f2.fetch(url, proxy=proxy, timeout=timeout)
+
+            async def _browser_fetch() -> Any:
+                from anansi.fetchers.browser import BrowserFetcher
+                async with BrowserFetcher(timeout=timeout) as bf:
+                    return await bf.fetch(url, proxy=proxy, timeout=timeout)
+
+            result = await escalate_akamai(
+                url=url,
+                initial=result,
+                retry_impersonated=_retry_impersonated,
+                browser_fetch=_browser_fetch,
+                disable_antibot=security.DISABLE_ANTIBOT,
+            )
+
         meta = {
             "url": result.url,
             "status": result.status,

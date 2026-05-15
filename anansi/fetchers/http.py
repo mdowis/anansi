@@ -19,10 +19,7 @@ from tenacity import (
 
 from anansi import security
 from anansi.fetchers.base import BaseFetcher, FetchResult
-from anansi.security import (
-    UnsafeURLError,
-    is_url_safe_for_public_fetch,
-)
+from anansi.security import is_url_safe_for_public_fetch
 
 logger = logging.getLogger(__name__)
 
@@ -338,8 +335,6 @@ class HTTPFetcher(BaseFetcher):
         timeout: float,
     ) -> FetchResult:
         """Fetch using httpx (standard path)."""
-        from urllib.parse import urljoin
-
         client = await self._get_client()
 
         # Rebuild client with proxy if needed (httpx doesn't support per-request proxy easily)

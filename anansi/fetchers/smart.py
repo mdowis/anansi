@@ -54,6 +54,44 @@ _THIN_PAGE_EXCLUSIONS: tuple[str, ...] = (
 # Input cap for expensive regex operations — avoids O(n²) on large pages.
 _HTML_CAP = 100_000
 
+# Body markers of an Akamai (Bot Manager / edge) hard block. Conservative on
+# purpose: a false positive triggers an expensive escalation ladder, so we
+# only fire on the unambiguous Akamai edge-error signature.
+_AKAMAI_BODY_MARKERS: tuple[str, ...] = (
+    "reference #",
+    "errors.edgesuite.net",
+    "akamaighost",
+    "access denied",
+)
+
+
+def detect_akamai_block(
+    html: str, status: int, headers: dict[str, str] | None = None
+) -> bool:
+    """Return True if the response looks like an Akamai edge bot-block.
+
+    Pure / synchronous (no I/O) — safe to call on every response. This is
+    deliberately separate from ``needs_browser`` (which excludes 403 /
+    access-denied pages as "intentionally thin"); an Akamai block must be
+    detected, not skipped. Detection is read-only classification and runs
+    even when anti-bot evasion is disabled — it lets callers report an
+    honest "blocked by Akamai" status instead of escalating.
+    """
+    server = ""
+    if headers:
+        # Header keys may be arbitrary case.
+        for k, v in headers.items():
+            if k.lower() == "server":
+                server = (v or "").lower()
+                break
+    if server.startswith("akamaighost"):
+        return True
+    if status in (403, 429):
+        sample = (html or "")[:_HTML_CAP].lower()
+        if any(m in sample for m in _AKAMAI_BODY_MARKERS):
+            return True
+    return False
+
 
 def needs_browser(html: str) -> bool:
     """Return True if *html* looks like a JS-rendered shell needing a browser.

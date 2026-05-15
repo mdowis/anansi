@@ -30,11 +30,13 @@ at minimum:
 ## Anti-bot and evasion features
 
 Anansi includes features that can reduce the likelihood of automated traffic being
-blocked — TLS-fingerprint impersonation (`curl-cffi`), stealth browser-fingerprint
-injection, user-agent rotation, and waiting out Cloudflare challenges. These exist
-to support **authorized** testing, security research, and scraping of content the
-user has a right to access (for example, sites that block well-behaved clients for
-no legitimate reason, or a site you own/operate).
+blocked — TLS/HTTP-2-fingerprint impersonation (`curl-cffi`), stealth
+browser-fingerprint injection, user-agent rotation, per-host session warm-up,
+waiting out Cloudflare challenges, and a graduated escalation ladder for
+edge bot-managers such as Akamai. These exist to support **authorized**
+testing, security research, and scraping of content the user has a right to
+access (for example, sites that block well-behaved clients for no legitimate
+reason, or a site you own/operate).
 
 Using these features to circumvent access controls, authentication, or anti-abuse
 measures **without authorization** may be unlawful and is **not endorsed or
@@ -45,9 +47,11 @@ operator can disable all evasion behavior by setting the environment variable:
 ANANSI_DISABLE_ANTIBOT=1
 ```
 
-When set, stealth-JS injection and the Cloudflare-challenge wait are disabled in
-the browser fetcher, and the HTTP fetcher ignores `impersonate=` (it logs a
-warning and falls back to a plain request).
+When set, this disables all evasion: stealth-JS injection, the
+Cloudflare-challenge wait, curl-cffi TLS/HTTP-2 impersonation, the per-host
+session warm-up, the browser→HTTP cookie hand-off, and the Akamai escalation
+ladder. Block *detection* still runs so the caller receives an honest
+"blocked" status. This switch always wins over `ANANSI_IMPERSONATE`.
 
 ## Network reach
 

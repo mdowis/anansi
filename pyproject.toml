@@ -38,7 +38,9 @@ dev = [
     "respx>=0.21,<1",
 ]
 tls = [
-    "curl-cffi>=0.6,<1",
+    # >=0.7 required for the recent impersonation targets in
+    # anansi.security.IMPERSONATE_ALLOWLIST (chrome131/133, safari18_0).
+    "curl-cffi>=0.7,<1",
 ]
 openai = [
     "openai>=1.0",
