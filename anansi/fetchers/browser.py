@@ -181,6 +181,20 @@ _CF_INDICATORS = [
     "__cf_chl",
 ]
 
+# Hard CF block pages (IP ban, WAF rule, rate limit).  These are NOT solvable
+# by waiting or clicking — they need a different IP or human intervention.
+# Distinct from the solvable challenge pages above.
+_CF_BLOCK_INDICATORS = [
+    "Sorry, you have been blocked",
+    "You are unable to access",
+    "This website is using a security service to protect itself",
+    "Error 1020",   # Access Denied (WAF rule)
+    "Error 1010",   # Your IP address is banned
+    "Error 1015",   # You are being rate limited
+    "Error 1012",   # IP address restricted
+    "Attention Required!",  # legacy CF block heading
+]
+
 
 def _bezier_points(
     x0: float, y0: float, x1: float, y1: float, steps: int = 12
@@ -346,18 +360,20 @@ class BrowserFetcher(BaseFetcher):
 
     @asynccontextmanager
     async def _get_context(
-        self, proxy: str | None = None
+        self, proxy: str | None = None, force_fresh: bool = False
     ) -> AsyncIterator[Any]:
         await self._ensure_browser()
         assert self._context_semaphore is not None
         assert self._context_pool is not None
 
         async with self._context_semaphore:
-            # Try to reuse an idle context (only when no proxy override)
+            # Try to reuse an idle context (only when no proxy override and not
+            # explicitly requesting a fresh one — the latter is used when a CF
+            # challenge timed out and we want a new fingerprint on retry).
             ctx = None
             created_at: float = 0.0
             req_count: int = 0
-            if proxy is None:
+            if proxy is None and not force_fresh:
                 try:
                     ctx, created_at, req_count = self._context_pool.get_nowait()
                     # Retire contexts that exceeded their age or request-count limit
@@ -413,7 +429,10 @@ class BrowserFetcher(BaseFetcher):
                 yield ctx
             finally:
                 req_count += 1
-                if proxy is None:
+                # force_fresh contexts are always closed after use — they were
+                # created for a single CF retry attempt and must not re-enter
+                # the pool (their fingerprint may already be flagged).
+                if proxy is None and not force_fresh:
                     try:
                         # Preserve original created_at so age is not reset on reuse
                         self._context_pool.put_nowait((ctx, created_at, req_count))
@@ -433,44 +452,121 @@ class BrowserFetcher(BaseFetcher):
     def _is_cloudflare_challenge(self, content: str) -> bool:
         return any(indicator in content for indicator in _CF_INDICATORS)
 
+    def _is_cloudflare_block(self, content: str) -> bool:
+        return any(indicator in content for indicator in _CF_BLOCK_INDICATORS)
+
+    async def _simulate_idle_human(self, page: Any) -> None:
+        """Micro-interactions that make the browser look human while waiting."""
+        x = random.randint(150, 850)
+        y = random.randint(100, 650)
+        await page.mouse.move(x, y)
+        await asyncio.sleep(random.uniform(0.04, 0.12))
+        for _ in range(random.randint(1, 3)):
+            await page.mouse.move(
+                x + random.randint(-12, 12),
+                y + random.randint(-8, 8),
+            )
+            await asyncio.sleep(random.uniform(0.03, 0.09))
+        if random.random() < 0.35:
+            await page.evaluate(f"window.scrollBy(0, {random.randint(-25, 55)})")
+            await asyncio.sleep(random.uniform(0.1, 0.22))
+
     async def _wait_for_cloudflare(self, page: Any) -> None:
+        """Poll until the Cloudflare challenge clears or times out.
+
+        Strategy:
+        1. Fail fast on hard IP/WAF blocks — they are not solvable by waiting.
+        2. Simulate idle human behaviour (mouse jitter, micro-scrolls) while
+           CF's JavaScript behavioural scoring runs.
+        3. Attempt Turnstile interaction with a mouse-first click (avoids the
+           programmatic-click signature that CF detects), trying multiple
+           widget selectors and rate-limiting attempts to ≤1 per 4 seconds.
+        4. Accept success from either: CF indicators disappearing from the DOM,
+           OR a cf_clearance cookie being set (whichever comes first).
         """
-        Poll until the Cloudflare challenge clears or times out.
-        Also attempts to click the Turnstile checkbox if visible.
-        """
-        # When the operator disabled anti-bot evasion, do not actively wait out
-        # or click through the Cloudflare challenge — return immediately and
-        # let the caller see whatever the server returned.
         from anansi import security
         if security.DISABLE_ANTIBOT:
             logger.info(
                 "ANANSI_DISABLE_ANTIBOT set — not waiting out Cloudflare challenge"
             )
             return
+
+        # Fail fast: hard blocks (IP ban, WAF rule) produce pages without any
+        # interactive challenge widget — waiting is pointless.
+        initial_content = await page.content()
+        if self._is_cloudflare_block(initial_content):
+            logger.warning(
+                "Cloudflare hard-block detected (no solvable challenge on page) — "
+                "returning block page as-is; a clean IP or residential proxy is needed"
+            )
+            return
+
         deadline = time.monotonic() + self._cf_timeout
+        _last_click_at: float = 0.0
+
         while time.monotonic() < deadline:
-            # Try clicking the Turnstile iframe checkbox
+            # Keep the browser looking human while CF's JS evaluates.
             try:
-                frame = next(
-                    (
-                        f for f in page.frames
-                        if "challenges.cloudflare.com" in (f.url or "")
-                    ),
-                    None,
-                )
-                if frame:
-                    checkbox = await frame.query_selector("input[type=checkbox]")
-                    if checkbox:
-                        await checkbox.click()
+                await self._simulate_idle_human(page)
             except Exception:
                 pass
 
-            await asyncio.sleep(2)
+            # Rate-limit Turnstile click attempts to ≤1 every 4 s so we
+            # don't look like an automated clicker to CF's behavioural engine.
+            now = time.monotonic()
+            if now - _last_click_at >= 4.0:
+                try:
+                    for frame in page.frames:
+                        frame_url = frame.url or ""
+                        if (
+                            "challenges.cloudflare.com" in frame_url
+                            or "turnstile" in frame_url
+                        ):
+                            # Try multiple selectors; the exact widget DOM varies
+                            # across CF challenge types and widget versions.
+                            for sel in [
+                                "input[type=checkbox]",
+                                ".cb-lb",
+                                ".cf-turnstile-wrapper",
+                                "[data-testid='checkbox']",
+                            ]:
+                                el = await frame.query_selector(sel)
+                                if el:
+                                    box = await el.bounding_box()
+                                    if box:
+                                        # Move mouse to element before clicking —
+                                        # a raw programmatic click is fingerprinted.
+                                        cx = box["x"] + box["width"] / 2 + random.uniform(-2, 2)
+                                        cy = box["y"] + box["height"] / 2 + random.uniform(-2, 2)
+                                        await page.mouse.move(cx, cy)
+                                        await asyncio.sleep(random.uniform(0.08, 0.20))
+                                        await el.click()
+                                        _last_click_at = time.monotonic()
+                                        break
+                            else:
+                                continue
+                            break
+                except Exception:
+                    pass
+
+            await asyncio.sleep(random.uniform(1.8, 2.4))
             content = await page.content()
+
             if not self._is_cloudflare_challenge(content):
                 return
 
-        raise TimeoutError(f"Cloudflare challenge did not resolve within {self._cf_timeout}s")
+            # cf_clearance cookie is CF's explicit success signal — accept it
+            # even if the DOM still transiently shows challenge markers.
+            try:
+                cookies = await page.context.cookies()
+                if any(c.get("name") == "cf_clearance" for c in cookies):
+                    return
+            except Exception:
+                pass
+
+        raise TimeoutError(
+            f"Cloudflare challenge did not resolve within {self._cf_timeout}s"
+        )
 
     async def _run_actions(self, page: Any, actions: list[dict[str, Any]]) -> None:
         """Execute a sequence of browser interactions after the initial page load.
@@ -572,95 +668,109 @@ class BrowserFetcher(BaseFetcher):
         t0 = time.perf_counter()
         effective_timeout = (timeout or self._timeout) * 1000  # ms
 
-        async with self._get_context(proxy) as ctx:
-            page = await ctx.new_page()
+        # On CF challenge timeout we retry once with a completely fresh browser
+        # context — new random UA, viewport, and hardware fingerprint.  The
+        # failed context is closed (not returned to the pool) via force_fresh.
+        for _cf_attempt in range(2):
+            _force_fresh = _cf_attempt > 0
             try:
-                if headers:
-                    await page.set_extra_http_headers(headers)
-
-                # Collect JSON API responses the page makes during navigation.
-                # The listener is registered before goto() so responses from
-                # the initial document load are captured.
-                _captured_resp_objects: list[Any] = []
-                if capture_network:
-                    async def _on_response(resp: Any) -> None:
-                        try:
-                            ct = resp.headers.get("content-type", "")
-                            if "json" not in ct:
-                                return
-                            if capture_patterns and not any(
-                                p in resp.url for p in capture_patterns
-                            ):
-                                return
-                            if len(_captured_resp_objects) < 50:
-                                _captured_resp_objects.append(resp)
-                        except Exception:
-                            pass
-                    page.on("response", _on_response)
-
-                await self._simulate_human(page)
-
-                resp = await page.goto(
-                    url,
-                    wait_until=wait_until,
-                    timeout=effective_timeout,
-                )
-
-                await asyncio.sleep(random.uniform(0.8, 2.0))
-
-                content = await page.content()
-
-                if self._is_cloudflare_challenge(content):
-                    await self._wait_for_cloudflare(page)
-                    content = await page.content()
-
-                if auto_consent:
-                    await _dismiss_cookie_consent(page)
-
-                if wait_for:
-                    from anansi.security import validate_browser_selector
-                    sel = validate_browser_selector(wait_for)
-                    await page.wait_for_selector(sel, timeout=effective_timeout)
-                    content = await page.content()
-
-                if actions:
-                    await self._run_actions(page, actions)
-                    content = await page.content()
-
-                status = resp.status if resp else 200
-                resp_headers = dict(resp.headers) if resp else {}
-                cookies = {
-                    c["name"]: c["value"]
-                    for c in await ctx.cookies()
-                }
-
-                # Read captured response bodies after all navigation is done.
-                captured_requests: list[dict[str, Any]] = []
-                for captured_resp in _captured_resp_objects:
+                async with self._get_context(proxy, force_fresh=_force_fresh) as ctx:
+                    page = await ctx.new_page()
                     try:
-                        body_bytes = await captured_resp.body()
-                        if len(body_bytes) > 200 * 1024:
-                            continue
-                        captured_requests.append({
-                            "url": captured_resp.url,
-                            "status": captured_resp.status,
-                            "body": json.loads(body_bytes),
-                        })
-                    except Exception:
-                        pass
+                        if headers:
+                            await page.set_extra_http_headers(headers)
 
-                return FetchResult(
-                    url=page.url,
-                    status=status,
-                    html=content,
-                    headers=resp_headers,
-                    cookies=cookies,
-                    elapsed=time.perf_counter() - t0,
-                    via_browser=True,
-                    captured_requests=captured_requests,
-                )
-            finally:
-                await page.close()
+                        # Collect JSON API responses the page makes during navigation.
+                        # The listener is registered before goto() so responses from
+                        # the initial document load are captured.
+                        _captured_resp_objects: list[Any] = []
+                        if capture_network:
+                            async def _on_response(resp: Any) -> None:
+                                try:
+                                    ct = resp.headers.get("content-type", "")
+                                    if "json" not in ct:
+                                        return
+                                    if capture_patterns and not any(
+                                        p in resp.url for p in capture_patterns
+                                    ):
+                                        return
+                                    if len(_captured_resp_objects) < 50:
+                                        _captured_resp_objects.append(resp)
+                                except Exception:
+                                    pass
+                            page.on("response", _on_response)
+
+                        await self._simulate_human(page)
+
+                        resp = await page.goto(
+                            url,
+                            wait_until=wait_until,
+                            timeout=effective_timeout,
+                        )
+
+                        await asyncio.sleep(random.uniform(0.8, 2.0))
+
+                        content = await page.content()
+
+                        if self._is_cloudflare_challenge(content):
+                            await self._wait_for_cloudflare(page)
+                            content = await page.content()
+
+                        if auto_consent:
+                            await _dismiss_cookie_consent(page)
+
+                        if wait_for:
+                            from anansi.security import validate_browser_selector
+                            sel = validate_browser_selector(wait_for)
+                            await page.wait_for_selector(sel, timeout=effective_timeout)
+                            content = await page.content()
+
+                        if actions:
+                            await self._run_actions(page, actions)
+                            content = await page.content()
+
+                        status = resp.status if resp else 200
+                        resp_headers = dict(resp.headers) if resp else {}
+                        cookies = {
+                            c["name"]: c["value"]
+                            for c in await ctx.cookies()
+                        }
+
+                        # Read captured response bodies after all navigation is done.
+                        captured_requests: list[dict[str, Any]] = []
+                        for captured_resp in _captured_resp_objects:
+                            try:
+                                body_bytes = await captured_resp.body()
+                                if len(body_bytes) > 200 * 1024:
+                                    continue
+                                captured_requests.append({
+                                    "url": captured_resp.url,
+                                    "status": captured_resp.status,
+                                    "body": json.loads(body_bytes),
+                                })
+                            except Exception:
+                                pass
+
+                        return FetchResult(
+                            url=page.url,
+                            status=status,
+                            html=content,
+                            headers=resp_headers,
+                            cookies=cookies,
+                            elapsed=time.perf_counter() - t0,
+                            via_browser=True,
+                            captured_requests=captured_requests,
+                        )
+                    finally:
+                        await page.close()
+            except TimeoutError:
+                if _cf_attempt == 0:
+                    logger.info(
+                        "Cloudflare challenge timed out on first attempt; "
+                        "retrying with a fresh browser context (new fingerprint)"
+                    )
+                    continue
+                raise
 
     async def screenshot(
         self,
