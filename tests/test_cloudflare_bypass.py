@@ -1,10 +1,12 @@
 """Tests for the improved Cloudflare bypass — block detection, human simulation,
-improved Turnstile interaction, cf_clearance cookie check, and fresh-context retry.
+improved Turnstile interaction, cf_clearance cookie check, fresh-context retry,
+5-second grace period, and stale-progress early-exit guard.
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -12,6 +14,8 @@ from anansi.fetchers.browser import (
     BrowserFetcher,
     _CF_BLOCK_INDICATORS,
     _CF_INDICATORS,
+    _USER_AGENTS,
+    _WEBRTC_BLOCK_JS,
 )
 
 
@@ -206,3 +210,114 @@ async def test_force_fresh_bypasses_pool() -> None:
 
 
 from typing import Any
+
+
+# ── User agent currency ───────────────────────────────────────────────────────
+
+def test_user_agents_are_chrome_131() -> None:
+    for ua in _USER_AGENTS:
+        assert "Chrome/131" in ua or "Edg/131" in ua, (
+            f"UA is not Chrome/Edge 131: {ua}"
+        )
+
+
+# ── WebRTC block JS preserves mediaDevices ────────────────────────────────────
+
+def test_webrtc_block_js_does_not_remove_media_devices() -> None:
+    assert "mediaDevices = undefined" not in _WEBRTC_BLOCK_JS
+    assert "enumerateDevices" in _WEBRTC_BLOCK_JS
+
+
+def test_webrtc_block_js_blocks_ice_servers() -> None:
+    assert "iceServers" in _WEBRTC_BLOCK_JS
+
+
+# ── Grace period resolves IUAM without a click ───────────────────────────────
+
+async def test_wait_for_cloudflare_grace_period_resolves_iuam(monkeypatch) -> None:
+    """IUAM challenge that auto-resolves during the grace period should return
+    before any Turnstile click is ever attempted."""
+    from anansi import security
+    monkeypatch.setattr(security, "DISABLE_ANTIBOT", False)
+
+    fetcher = BrowserFetcher(cf_wait_timeout=60.0)
+    # Speed up: 1 grace iteration (1 s sleep) instead of 5
+    fetcher._CF_GRACE_ITERS = 1
+
+    content_calls = 0
+
+    class _FakeContext:
+        async def cookies(self):
+            return []  # never issues cf_clearance
+
+    class _FakePage:
+        frames = []
+        context = _FakeContext()
+
+        async def content(self) -> str:
+            nonlocal content_calls
+            content_calls += 1
+            # Challenge present on first call (initial_content), gone afterwards
+            if content_calls == 1:
+                return "Just a moment cf-turnstile __cf_chl"
+            return "<html><body>Welcome</body></html>"
+
+        class mouse:
+            @staticmethod
+            async def move(x, y) -> None:
+                pass
+
+        @staticmethod
+        async def evaluate(script: str) -> None:
+            pass
+
+    t0 = time.monotonic()
+    await fetcher._wait_for_cloudflare(_FakePage())
+    elapsed = time.monotonic() - t0
+    # Should resolve during grace period (1 s sleep + content check)
+    assert elapsed < 5.0, f"IUAM grace-period resolution took {elapsed:.1f}s"
+    # No click should have been attempted (frames=[])
+    assert content_calls >= 2
+
+
+# ── Stale-progress guard — early exit when challenge never moves ──────────────
+
+async def test_wait_for_cloudflare_no_progress_early_exit(monkeypatch) -> None:
+    """If page content never changes and no Turnstile widget is found, the
+    stale-progress guard fires early instead of burning the full timeout."""
+    from anansi import security
+    monkeypatch.setattr(security, "DISABLE_ANTIBOT", False)
+
+    fetcher = BrowserFetcher(cf_wait_timeout=60.0)
+    # Speed up: skip grace period, stale guard fires after 2 s
+    fetcher._CF_GRACE_ITERS = 0
+    fetcher._CF_STALE_GUARD_S = 2.0
+
+    class _FakeContext:
+        async def cookies(self):
+            return []
+
+    class _FakePage:
+        frames = []
+        context = _FakeContext()
+
+        async def content(self) -> str:
+            return "Just a moment cf-turnstile __cf_chl"
+
+        class mouse:
+            @staticmethod
+            async def move(x, y) -> None:
+                pass
+
+        @staticmethod
+        async def evaluate(script: str) -> None:
+            pass
+
+    t0 = time.monotonic()
+    with pytest.raises(TimeoutError, match="not progressing"):
+        await fetcher._wait_for_cloudflare(_FakePage())
+    elapsed = time.monotonic() - t0
+    # Guard fires after 2 s stale + ≤1 poll cycle overhead
+    assert elapsed < 10.0, f"stale guard should fire quickly, took {elapsed:.1f}s"
+    # Must not burn the full 60 s timeout
+    assert elapsed < 60.0

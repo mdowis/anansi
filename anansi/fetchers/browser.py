@@ -212,9 +212,9 @@ def _bezier_points(
 
 
 _USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
 ]
 
 _VIEWPORTS = [
@@ -279,12 +279,24 @@ async def _dismiss_cookie_consent(page: Any) -> bool:
 # WebRTC leak mitigation — hides real IP even when behind a proxy
 _WEBRTC_BLOCK_JS = """
 (function() {
-  try {
-    Object.defineProperty(navigator, 'mediaDevices', { get: () => undefined });
-  } catch(_) {}
+  // Block WebRTC ICE to prevent IP leaks through proxies
   if (window.RTCPeerConnection) {
-    window.RTCPeerConnection = undefined;
+    const _OrigRTC = window.RTCPeerConnection;
+    window.RTCPeerConnection = function(cfg, ...args) {
+      if (cfg && cfg.iceServers) cfg.iceServers = [];
+      return new _OrigRTC(cfg, ...args);
+    };
+    Object.setPrototypeOf(window.RTCPeerConnection, _OrigRTC);
   }
+  // Spoof mediaDevices — keep the object (removing it is suspicious to CF)
+  // but prevent real device enumeration
+  try {
+    if (navigator.mediaDevices) {
+      navigator.mediaDevices.enumerateDevices = () => Promise.resolve([]);
+      navigator.mediaDevices.getUserMedia = () =>
+        Promise.reject(new DOMException('Permission denied', 'NotAllowedError'));
+    }
+  } catch(_) {}
 })();
 """
 
@@ -296,6 +308,10 @@ class BrowserFetcher(BaseFetcher):
     Maintains a single persistent browser instance and a pool of contexts
     to avoid the overhead of launching a browser per request.
     """
+
+    # Overridable in tests to avoid real wall-clock waits
+    _CF_GRACE_ITERS: int = 5     # 1-second iterations before first click attempt
+    _CF_STALE_GUARD_S: float = 20.0  # seconds of no content change → early exit
 
     def __init__(
         self,
@@ -475,13 +491,17 @@ class BrowserFetcher(BaseFetcher):
         """Poll until the Cloudflare challenge clears or times out.
 
         Strategy:
-        1. Fail fast on hard IP/WAF blocks — they are not solvable by waiting.
-        2. Simulate idle human behaviour (mouse jitter, micro-scrolls) while
-           CF's JavaScript behavioural scoring runs.
-        3. Attempt Turnstile interaction with a mouse-first click (avoids the
-           programmatic-click signature that CF detects), trying multiple
-           widget selectors and rate-limiting attempts to ≤1 per 4 seconds.
-        4. Accept success from either: CF indicators disappearing from the DOM,
+        1. Fail fast on hard IP/WAF blocks (Error 1020/1010/1015) — not solvable.
+        2. 5-second grace period: simulate idle human behaviour while CF's JS
+           behavioural scoring runs. CF IUAM auto-resolves after ~5 s; clicking
+           during this window can reset the timer.
+        3. Poll loop: attempt Turnstile interaction across ALL frames (not just
+           CF-URL frames — managed challenge embeds directly in the main frame).
+           Rate-limit clicks to ≤1 per 4 s to avoid automated-clicker detection.
+        4. Progress guard: if content hasn't changed in 20 s and no Turnstile
+           widget was ever found, raise immediately with proxy guidance rather
+           than burning the remaining timeout on an unsolvable challenge.
+        5. Accept success from either: CF indicators disappearing from the DOM,
            OR a cf_clearance cookie being set (whichever comes first).
         """
         from anansi import security
@@ -491,8 +511,7 @@ class BrowserFetcher(BaseFetcher):
             )
             return
 
-        # Fail fast: hard blocks (IP ban, WAF rule) produce pages without any
-        # interactive challenge widget — waiting is pointless.
+        # Fail fast: hard blocks (IP ban, WAF rule) have no solvable widget.
         initial_content = await page.content()
         if self._is_cloudflare_block(initial_content):
             logger.warning(
@@ -501,50 +520,70 @@ class BrowserFetcher(BaseFetcher):
             )
             return
 
+        # ── Grace period ─────────────────────────────────────────────────────
+        # CF IUAM evaluates JS for ~5 s then auto-redirects. Wait out that
+        # window with only idle mouse movement so we don't interfere with CF's
+        # behavioural timer. Check for early resolution after each second.
+        for _ in range(self._CF_GRACE_ITERS):
+            try:
+                await self._simulate_idle_human(page)
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+            try:
+                if any(
+                    c.get("name") == "cf_clearance"
+                    for c in await page.context.cookies()
+                ):
+                    return
+            except Exception:
+                pass
+            try:
+                if not self._is_cloudflare_challenge(await page.content()):
+                    return
+            except Exception:
+                pass
+
         deadline = time.monotonic() + self._cf_timeout
         _last_click_at: float = 0.0
+        _last_content_hash: int = hash(initial_content)
+        _last_change_at: float = time.monotonic()
+
+        # CF-specific selectors ordered from most-specific to least-specific.
+        # We search ALL frames (including the main frame) because CF Managed
+        # Challenge embeds the widget directly without a separate iframe.
+        _CF_CLICK_SELECTORS = [
+            ".cb-lb",                          # CF challenge body label (Turnstile)
+            "[data-testid='checkbox']",        # Turnstile interactive checkbox
+            ".cf-turnstile-wrapper input",     # Turnstile wrapper → input
+            "#challenge-stage input[type=checkbox]",  # Managed challenge (main frame)
+            "#challenge-form button[type=submit]",    # IUAM submit (main frame)
+        ]
 
         while time.monotonic() < deadline:
-            # Keep the browser looking human while CF's JS evaluates.
             try:
                 await self._simulate_idle_human(page)
             except Exception:
                 pass
 
-            # Rate-limit Turnstile click attempts to ≤1 every 4 s so we
-            # don't look like an automated clicker to CF's behavioural engine.
             now = time.monotonic()
             if now - _last_click_at >= 4.0:
                 try:
                     for frame in page.frames:
-                        frame_url = frame.url or ""
-                        if (
-                            "challenges.cloudflare.com" in frame_url
-                            or "turnstile" in frame_url
-                        ):
-                            # Try multiple selectors; the exact widget DOM varies
-                            # across CF challenge types and widget versions.
-                            for sel in [
-                                "input[type=checkbox]",
-                                ".cb-lb",
-                                ".cf-turnstile-wrapper",
-                                "[data-testid='checkbox']",
-                            ]:
-                                el = await frame.query_selector(sel)
-                                if el:
-                                    box = await el.bounding_box()
-                                    if box:
-                                        # Move mouse to element before clicking —
-                                        # a raw programmatic click is fingerprinted.
-                                        cx = box["x"] + box["width"] / 2 + random.uniform(-2, 2)
-                                        cy = box["y"] + box["height"] / 2 + random.uniform(-2, 2)
-                                        await page.mouse.move(cx, cy)
-                                        await asyncio.sleep(random.uniform(0.08, 0.20))
-                                        await el.click()
-                                        _last_click_at = time.monotonic()
-                                        break
-                            else:
-                                continue
+                        for sel in _CF_CLICK_SELECTORS:
+                            el = await frame.query_selector(sel)
+                            if el:
+                                box = await el.bounding_box()
+                                if box:
+                                    cx = box["x"] + box["width"] / 2 + random.uniform(-2, 2)
+                                    cy = box["y"] + box["height"] / 2 + random.uniform(-2, 2)
+                                    await page.mouse.move(cx, cy)
+                                    await asyncio.sleep(random.uniform(0.08, 0.20))
+                                    await el.click()
+                                    _last_click_at = time.monotonic()
+                                    _last_change_at = time.monotonic()
+                                    break
+                        if _last_click_at == now:
                             break
                 except Exception:
                     pass
@@ -555,8 +594,6 @@ class BrowserFetcher(BaseFetcher):
             if not self._is_cloudflare_challenge(content):
                 return
 
-            # cf_clearance cookie is CF's explicit success signal — accept it
-            # even if the DOM still transiently shows challenge markers.
             try:
                 cookies = await page.context.cookies()
                 if any(c.get("name") == "cf_clearance" for c in cookies):
@@ -564,8 +601,32 @@ class BrowserFetcher(BaseFetcher):
             except Exception:
                 pass
 
+            # Progress guard: if content is unchanged for 20 s and we have
+            # never successfully clicked a Turnstile widget, this challenge is
+            # almost certainly unsolvable (enterprise IP reputation block).
+            new_hash = hash(content)
+            if new_hash != _last_content_hash:
+                _last_content_hash = new_hash
+                _last_change_at = time.monotonic()
+            elif (
+                time.monotonic() - _last_change_at > self._CF_STALE_GUARD_S
+                and _last_click_at == 0.0
+            ):
+                raise TimeoutError(
+                    f"Cloudflare challenge is not progressing (page unchanged for "
+                    f"{self._CF_STALE_GUARD_S:.0f} s, no Turnstile widget found). "
+                    "This site likely uses Cloudflare Enterprise Bot Management "
+                    "with IP reputation scoring — datacenter IPs are blocked before "
+                    "any solvable challenge is issued. Pass a residential or ISP "
+                    "proxy via the `proxy` parameter to bypass this."
+                )
+
         raise TimeoutError(
-            f"Cloudflare challenge did not resolve within {self._cf_timeout}s"
+            f"Cloudflare challenge did not resolve within {self._cf_timeout}s. "
+            "If this site uses Cloudflare Enterprise Bot Management, datacenter "
+            "IPs are blocked regardless of browser fingerprint. Pass a residential "
+            "or ISP proxy via the `proxy` parameter "
+            "(e.g. proxy='http://user:pass@host:port')."
         )
 
     async def _run_actions(self, page: Any, actions: list[dict[str, Any]]) -> None:
