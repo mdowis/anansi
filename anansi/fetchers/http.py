@@ -18,6 +18,7 @@ from tenacity import (
 )
 
 from anansi import security
+from anansi.bot_profiles import BotProfile, get_profile
 from anansi.fetchers.base import BaseFetcher, FetchResult
 from anansi.security import InvalidImpersonateError, is_url_safe_for_public_fetch, validate_impersonate
 
@@ -75,20 +76,35 @@ _USER_AGENTS = [
 ]
 
 
-def _build_headers(ua: str, extra: dict[str, str] | None = None) -> dict[str, str]:
-    headers = {
-        "User-Agent": ua,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": random.choice(_ACCEPT_LANGUAGES),
-        "Accept-Encoding": "gzip, deflate, br",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-    }
+def _build_headers(
+    ua: str,
+    extra: dict[str, str] | None = None,
+    profile: "BotProfile | None" = None,
+) -> dict[str, str]:
+    if profile is not None:
+        # A bot profile pins the UA and supplies its own (crawler-accurate)
+        # header set. Skip the browser default block so browser-only headers
+        # (Sec-Fetch-*, DNT, Upgrade-Insecure-Requests) are not leaked next to
+        # a crawler UA. Connection is kept as a transport-level default.
+        headers = {
+            "User-Agent": profile.user_agent,
+            "Connection": "keep-alive",
+            **profile.headers,
+        }
+    else:
+        headers = {
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": random.choice(_ACCEPT_LANGUAGES),
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+        }
     if extra:
         headers.update(extra)
     return headers
@@ -112,14 +128,22 @@ class HTTPFetcher(BaseFetcher):
         http2: bool = True,
         cookies: dict[str, str] | None = None,
         impersonate: str | None = None,
+        bot_profile: str | BotProfile | None = None,
         max_response_bytes: int = _DEFAULT_MAX_RESPONSE_BYTES,
     ) -> None:
         self._max_retries = max_retries
         self._timeout = timeout
         self._follow_redirects = follow_redirects
-        self._rotate_ua = rotate_user_agents
         self._http2 = http2
-        self._ua = random.choice(_USER_AGENTS)
+        # A bot profile (e.g. Googlebot) pins the UA and disables rotation: a
+        # crawler must not present a different identity on every request.
+        self._profile = get_profile(bot_profile)
+        if self._profile is not None:
+            self._rotate_ua = False
+            self._ua = self._profile.user_agent
+        else:
+            self._rotate_ua = rotate_user_agents
+            self._ua = random.choice(_USER_AGENTS)
         self._client: httpx.AsyncClient | None = None
         self._base_cookies = cookies or {}
         self._session_cookies: dict[str, str] = {}
@@ -163,7 +187,7 @@ class HTTPFetcher(BaseFetcher):
         if referer and not any(k.lower() == "referer" for k in extra):
             extra["Referer"] = referer
 
-        merged_headers = _build_headers(self._ua, extra)
+        merged_headers = _build_headers(self._ua, extra, self._profile)
 
         # Resolve effective TLS impersonation target. Per-request value wins
         # over the instance-level default; explicit None forces plain httpx

@@ -27,6 +27,7 @@ from mcp.server.fastmcp import FastMCP
 
 from anansi.db import DATA_DIR
 from anansi import security
+from anansi.bot_profiles import UnknownBotProfileError
 from anansi.security import (
     InvalidImpersonateError,
     OutOfRangeError,
@@ -120,6 +121,20 @@ def _resolve_impersonate(value: str | None) -> str | None:
     if value is not None:
         return validate_impersonate(value)
     return security.IMPERSONATE_DEFAULT
+
+
+def _resolve_bot_profile(value: str | None) -> str | None:
+    """Validate a caller-supplied bot-profile name against the registry.
+
+    Returns the name unchanged if known, ``None`` if not supplied. Raises
+    ``UnknownBotProfileError`` for an unknown name; callers convert that into a
+    structured tool error (the MCP client is untrusted, like ``impersonate``).
+    """
+    if value is None:
+        return None
+    from anansi.bot_profiles import get_profile
+    get_profile(value)  # raises UnknownBotProfileError on a bad name
+    return value
 
 
 def _validate_url(url: str) -> None:
@@ -321,6 +336,7 @@ async def _fetch_one(
     chunk_index: int = 0,
     actions: list[dict[str, Any]] | None = None,
     impersonate: str | None = None,
+    bot_profile: str | None = None,
     capture_network: bool = False,
     capture_patterns: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -345,7 +361,9 @@ async def _fetch_one(
     else:
         if use_browser:
             from anansi.fetchers.browser import BrowserFetcher
-            async with BrowserFetcher(timeout=timeout) as fetcher:
+            async with BrowserFetcher(
+                timeout=timeout, bot_profile=bot_profile
+            ) as fetcher:
                 result = await fetcher.fetch(
                     url,
                     proxy=proxy,
@@ -358,7 +376,7 @@ async def _fetch_one(
         else:
             from anansi.fetchers.http import HTTPFetcher
             async with HTTPFetcher(
-                timeout=timeout, impersonate=impersonate
+                timeout=timeout, impersonate=impersonate, bot_profile=bot_profile
             ) as fetcher:
                 result = await fetcher.fetch(url, proxy=proxy, timeout=timeout)
 
@@ -373,13 +391,15 @@ async def _fetch_one(
             async def _retry_impersonated() -> Any:
                 target = impersonate or security.IMPERSONATE_DEFAULT or DEFAULT_IMPERSONATE
                 async with HTTPFetcher(
-                    timeout=timeout, impersonate=target
+                    timeout=timeout, impersonate=target, bot_profile=bot_profile
                 ) as f2:
                     return await f2.fetch(url, proxy=proxy, timeout=timeout)
 
             async def _browser_fetch() -> Any:
                 from anansi.fetchers.browser import BrowserFetcher
-                async with BrowserFetcher(timeout=timeout) as bf:
+                async with BrowserFetcher(
+                    timeout=timeout, bot_profile=bot_profile
+                ) as bf:
                     return await bf.fetch(url, proxy=proxy, timeout=timeout)
 
             result = await escalate_akamai(
@@ -458,6 +478,7 @@ async def fetch_url(
     chunk_index: int = 0,
     actions: list[dict[str, Any]] | None = None,
     impersonate: str | None = None,
+    bot_profile: str | None = None,
     capture_network: bool = False,
     capture_patterns: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -495,6 +516,10 @@ async def fetch_url(
                      (Akamai/Cloudflare/DataDome). Must be an allowlisted
                      target; ignored if the operator set ANANSI_DISABLE_ANTIBOT.
                      Defaults to the operator's ANANSI_IMPERSONATE if unset.
+        bot_profile: Optional crawler identity to present as, e.g. "googlebot" or
+                     "googlebot-mobile". Pins the User-Agent to that crawler and
+                     sends its minimal header set (no browser Sec-Fetch-*/DNT).
+                     Independent of impersonate (does not change TLS fingerprint).
         capture_network: Browser-only. When True, intercept JSON API responses the
                          page makes during load and actions. Useful for API-first SPAs
                          (React/Next.js/Vue) where HTML contains little data. Results
@@ -527,6 +552,10 @@ async def fetch_url(
         impersonate = _resolve_impersonate(impersonate)
     except InvalidImpersonateError as exc:
         return {"error": f"invalid impersonate: {exc}"}
+    try:
+        bot_profile = _resolve_bot_profile(bot_profile)
+    except UnknownBotProfileError as exc:
+        return {"error": f"invalid bot_profile: {exc}"}
     if wait_for_selector is not None:
         try:
             validate_browser_selector(wait_for_selector)
@@ -543,6 +572,7 @@ async def fetch_url(
         chunk_index=chunk_index,
         actions=actions,
         impersonate=impersonate,
+        bot_profile=bot_profile,
         capture_network=capture_network,
         capture_patterns=capture_patterns,
     )
@@ -560,6 +590,7 @@ async def fetch_urls(
     chunk_size: int | None = None,
     concurrency: int = 5,
     impersonate: str | None = None,
+    bot_profile: str | None = None,
 ) -> dict[str, Any]:
     """
     Fetch multiple URLs in one call, returning results in the same order.
@@ -583,6 +614,8 @@ async def fetch_urls(
                      target (e.g. "chrome124") applied to every request;
                      ignored under ANANSI_DISABLE_ANTIBOT; defaults to the
                      operator's ANANSI_IMPERSONATE.
+        bot_profile: Optional crawler identity (e.g. "googlebot") applied to
+                     every request — pins the crawler User-Agent + headers.
 
     Returns:
         {results: [...], total, succeeded, failed}
@@ -608,6 +641,10 @@ async def fetch_urls(
         impersonate = _resolve_impersonate(impersonate)
     except InvalidImpersonateError as exc:
         return {"error": f"invalid impersonate: {exc}"}
+    try:
+        bot_profile = _resolve_bot_profile(bot_profile)
+    except UnknownBotProfileError as exc:
+        return {"error": f"invalid bot_profile: {exc}"}
 
     sem = asyncio.Semaphore(concurrency)
 
@@ -623,6 +660,7 @@ async def fetch_urls(
                     chunk_size=chunk_size,
                     chunk_index=0,
                     impersonate=impersonate,
+                    bot_profile=bot_profile,
                 )
             except Exception as exc:
                 return {"url": url, "error": str(exc), "status": None}
@@ -647,6 +685,7 @@ async def fetch_and_extract(
     proxy: str | None = None,
     timeout: float = 30.0,
     impersonate: str | None = None,
+    bot_profile: str | None = None,
 ) -> dict[str, Any]:
     """
     Fetch a URL and extract structured data in a single tool call.
@@ -665,6 +704,8 @@ async def fetch_and_extract(
         impersonate: Optional allowlisted curl-cffi TLS/HTTP-2 fingerprint
                      target (e.g. "chrome124"); ignored under
                      ANANSI_DISABLE_ANTIBOT; defaults to ANANSI_IMPERSONATE.
+        bot_profile: Optional crawler identity (e.g. "googlebot") — pins the
+                     crawler User-Agent + headers for the fetch.
 
     Returns:
         {url, status, elapsed, via_browser, data: {field: value, ...}}
@@ -677,6 +718,10 @@ async def fetch_and_extract(
         impersonate = _resolve_impersonate(impersonate)
     except InvalidImpersonateError as exc:
         return {"error": f"invalid impersonate: {exc}"}
+    try:
+        bot_profile = _resolve_bot_profile(bot_profile)
+    except UnknownBotProfileError as exc:
+        return {"error": f"invalid bot_profile: {exc}"}
     result = await _fetch_one(
         url,
         use_browser=use_browser,
@@ -684,6 +729,7 @@ async def fetch_and_extract(
         timeout=timeout,
         format="html",
         impersonate=impersonate,
+        bot_profile=bot_profile,
     )
     if "error" in result:
         return result
@@ -762,6 +808,7 @@ async def crawl_site(
     max_duration_seconds: float | None = None,
     forward_credentials_cross_origin: bool = False,
     impersonate: str | None = None,
+    bot_profile: str | None = None,
 ) -> dict[str, Any]:
     """
     Crawl a website and extract structured data from every page.
@@ -810,6 +857,11 @@ async def crawl_site(
                      the crawl, for edge-fingerprinting WAFs (Akamai/Cloudflare/
                      DataDome). Ignored under ANANSI_DISABLE_ANTIBOT; defaults
                      to the operator's ANANSI_IMPERSONATE.
+        bot_profile: Optional crawler identity for the whole crawl, e.g.
+                     "googlebot" or "googlebot-mobile". Pins the crawler
+                     User-Agent + minimal headers on every fetch and makes
+                     robots.txt compliance evaluate against that crawler's
+                     agent token (e.g. "Googlebot") instead of "*".
 
     Returns:
         {crawl_id, status, message, start_url, max_pages}
@@ -837,6 +889,11 @@ async def crawl_site(
         impersonate = _resolve_impersonate(impersonate)
     except InvalidImpersonateError as exc:
         return {"error": f"invalid impersonate: {exc}"}
+
+    try:
+        bot_profile = _resolve_bot_profile(bot_profile)
+    except UnknownBotProfileError as exc:
+        return {"error": f"invalid bot_profile: {exc}"}
 
     # Validate regex inputs — link_pattern and each deny_pattern — against an
     # obvious-ReDoS heuristic and a length cap. Catastrophic-backtracking
@@ -916,7 +973,7 @@ async def crawl_site(
     fetcher = None
     if use_browser:
         from anansi.fetchers.browser import BrowserFetcher
-        fetcher = BrowserFetcher()
+        fetcher = BrowserFetcher(bot_profile=bot_profile)
 
     # When the caller has not opted into cross-origin credential forwarding,
     # confine cookies and auth headers to the registrable domain of start_url.
@@ -937,6 +994,7 @@ async def crawl_site(
         credential_scope_host=scope_host,
         deduplicate_content=deduplicate_content,
         impersonate=impersonate,
+        bot_profile=bot_profile,
     )
     _active_crawlers[crawl_id] = crawler
 

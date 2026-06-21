@@ -20,6 +20,15 @@ def main() -> None:
     fetch_p.add_argument("--browser", action="store_true", help="Use headless browser")
     fetch_p.add_argument("--proxy", help="Proxy URL")
     fetch_p.add_argument("--output", choices=["html", "text", "markdown"], default="html")
+    fetch_p.add_argument(
+        "--bot-profile",
+        help="Present as a known crawler (e.g. 'googlebot', 'googlebot-mobile')",
+    )
+    fetch_p.add_argument(
+        "--as-googlebot",
+        action="store_true",
+        help="Shorthand for --bot-profile googlebot",
+    )
 
     # mcp subcommand
     sub.add_parser("mcp", help="Start the MCP server")
@@ -47,13 +56,22 @@ async def _cmd_fetch(args: argparse.Namespace) -> None:
 
     console = Console()
 
+    bot_profile = "googlebot" if getattr(args, "as_googlebot", False) else args.bot_profile
+
+    from anansi.bot_profiles import UnknownBotProfileError, get_profile
+    try:
+        get_profile(bot_profile)  # fail fast on a bad --bot-profile name
+    except UnknownBotProfileError as exc:
+        console.print(f"[bold red]error:[/] {exc}")
+        sys.exit(1)
+
     if args.browser:
         from anansi.fetchers.browser import BrowserFetcher
-        async with BrowserFetcher() as fetcher:
+        async with BrowserFetcher(bot_profile=bot_profile) as fetcher:
             result = await fetcher.fetch(args.url, proxy=args.proxy)
     else:
         from anansi.fetchers.http import HTTPFetcher
-        async with HTTPFetcher() as fetcher:
+        async with HTTPFetcher(bot_profile=bot_profile) as fetcher:
             result = await fetcher.fetch(args.url, proxy=args.proxy)
 
     console.print(f"[bold green]HTTP {result.status}[/] {result.url}  [{result.elapsed:.2f}s]")
