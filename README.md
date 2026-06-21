@@ -240,6 +240,36 @@ async with HTTPFetcher(impersonate="chrome124") as f:
 
 Without `[tls]` installed, Anansi logs a warning and falls back to standard httpx automatically — no code change required.
 
+### Impersonating crawlers (Googlebot)
+
+Some sites serve their full, ungated content to search-engine crawlers for SEO
+while gating browsers behind consent walls or JS shells. A **bot profile** makes
+Anansi present as a known crawler: it pins the `User-Agent` to that crawler's
+string, sends its accurate (minimal) header set — dropping the browser-only
+`Sec-Fetch-*` / `DNT` / `Upgrade-Insecure-Requests` headers — and, in a crawl,
+evaluates `robots.txt` against that crawler's agent token (e.g. `Googlebot`)
+instead of `*`. Built-in profiles: `googlebot`, `googlebot-mobile`.
+
+```python
+from anansi.fetchers.http import HTTPFetcher
+from anansi.spider.crawler import Crawler
+
+# Single fetch presenting as Googlebot
+async with HTTPFetcher(bot_profile="googlebot") as f:
+    result = await f.fetch("https://example.com/article")
+
+# Whole crawl as Googlebot — robots.txt is obeyed as "Googlebot"
+crawler = Crawler(MySpider, bot_profile="googlebot")
+```
+
+`bot_profile` is independent of `impersonate`: it changes the presented identity
+(UA + headers), not the TLS fingerprint. Combine them if a site checks both.
+
+> **Note:** this only spoofs the User-Agent. Sites that verify crawlers by
+> reverse DNS / source-IP ranges will still see a non-Google address — spoofing
+> the UA does not place you on Google's network. Use responsibly and within the
+> site's Terms of Service.
+
 ### CLI
 
 ```bash
@@ -248,6 +278,10 @@ anansi fetch https://example.com --output markdown
 
 # Use browser (Cloudflare bypass, JS rendering)
 anansi fetch https://protected-site.com --browser
+
+# Fetch presenting as Googlebot
+anansi fetch https://example.com --as-googlebot
+anansi fetch https://example.com --bot-profile googlebot-mobile
 
 # List all recorded crawls
 anansi crawls
@@ -310,6 +344,7 @@ python -m anansi.mcp_server.server
 | `chunk_index` | `0` | Which chunk to return (0-indexed) |
 | `actions` | `null` | Browser interactions to run after page load (see below) |
 | `impersonate` | `null` | curl-cffi TLS/HTTP-2 fingerprint target (e.g. `"chrome124"`); falls back to `ANANSI_IMPERSONATE` env var; per-request, overrides the instance default |
+| `bot_profile` | `null` | Present as a known crawler: `"googlebot"` or `"googlebot-mobile"`. Pins the crawler User-Agent + minimal headers (and, in a crawl, evaluates robots.txt as that crawler). Independent of `impersonate`. |
 | `capture_network` | `false` | **Browser only.** Intercept JSON API responses the page makes during load/actions. Returns raw payloads in `captured_requests` — ideal for API-first SPAs. Bypasses cache. |
 | `capture_patterns` | `null` | URL substrings to filter captured responses (e.g. `["/api/", "/graphql"]`). Max 20 entries. Requires `capture_network=true`. |
 

@@ -320,8 +320,15 @@ class Crawler:
         canonicalize_urls: bool = True,
         worker_timeout: float = 120.0,
         impersonate: str | None = None,
+        bot_profile: str | None = None,
     ) -> None:
         self._impersonate = impersonate
+        # Optional crawler identity (e.g. "googlebot"): pins the UA on every
+        # fetcher this crawler builds and makes robots.txt evaluate against the
+        # profile's agent token.
+        from anansi.bot_profiles import get_profile
+        self._bot_profile = bot_profile
+        self._profile = get_profile(bot_profile)
         self._spider_cls = spider_class
         self._concurrency = concurrency
         self._delay = delay
@@ -370,7 +377,8 @@ class Crawler:
         self._robots: Any | None = None
         if respect_robots:
             from anansi.robots import RobotsCache
-            self._robots = RobotsCache()
+            robots_ua = self._profile.robots_user_agent if self._profile else "*"
+            self._robots = RobotsCache(user_agent=robots_ua)
 
         self._semaphore: asyncio.Semaphore | None = None
         self._pause_event = asyncio.Event()   # set = paused
@@ -799,7 +807,10 @@ class Crawler:
             self._host_fetchers.move_to_end(host)
             return existing
 
-        fetcher = HTTPFetcher(cookies=cookies, impersonate=self._impersonate)
+        fetcher = HTTPFetcher(
+            cookies=cookies, impersonate=self._impersonate,
+            bot_profile=self._bot_profile,
+        )
         self._host_fetchers[host] = fetcher
         # LRU-evict, closing the evicted fetcher's client.
         while len(self._host_fetchers) > self._max_tracked_domains:
@@ -841,7 +852,8 @@ class Crawler:
         fetcher = self._host_fetchers.get(host)
         if fetcher is None:
             fetcher = HTTPFetcher(
-                cookies=self._cookies, impersonate=self._impersonate
+                cookies=self._cookies, impersonate=self._impersonate,
+                bot_profile=self._bot_profile,
             )
             self._host_fetchers[host] = fetcher
         fetcher._session_cookies.update(cookies)
@@ -854,7 +866,7 @@ class Crawler:
         # Explicit browser flag — skip all auto-detection logic
         if use_browser:
             from anansi.fetchers.browser import BrowserFetcher
-            fetcher = self._fetcher if isinstance(self._fetcher, BrowserFetcher) else BrowserFetcher()
+            fetcher = self._fetcher if isinstance(self._fetcher, BrowserFetcher) else BrowserFetcher(bot_profile=self._bot_profile)
             result = await fetcher.fetch(url, proxy=proxy)
             self._handoff_browser_cookies(url, result)
             return result
@@ -865,7 +877,7 @@ class Crawler:
         if self._auto_browser and self._domain_needs_browser.get(domain):
             from anansi.fetchers.browser import BrowserFetcher
             logger.debug("Domain %s cached as JS-rendered — using BrowserFetcher", domain)
-            bf = BrowserFetcher()
+            bf = BrowserFetcher(bot_profile=self._bot_profile)
             result = await bf.fetch(url, proxy=proxy)
             self._handoff_browser_cookies(url, result)
             return result
@@ -923,7 +935,8 @@ class Crawler:
                             pass
                     target = self._impersonate or DEFAULT_IMPERSONATE
                     f2 = HTTPFetcher(
-                        cookies=cookies_for_request, impersonate=target
+                        cookies=cookies_for_request, impersonate=target,
+                        bot_profile=self._bot_profile,
                     )
                     self._host_fetchers[domain] = f2
                     if not security.DISABLE_ANTIBOT:
@@ -947,7 +960,7 @@ class Crawler:
 
             async def _browser_fetch():
                 from anansi.fetchers.browser import BrowserFetcher
-                bf = BrowserFetcher()
+                bf = BrowserFetcher(bot_profile=self._bot_profile)
                 return await bf.fetch(url, proxy=proxy)
 
             result = await escalate_akamai(
@@ -973,7 +986,7 @@ class Crawler:
                 while len(self._domain_needs_browser) > self._max_tracked_domains:
                     self._domain_needs_browser.popitem(last=False)
                 from anansi.fetchers.browser import BrowserFetcher
-                bf = BrowserFetcher()
+                bf = BrowserFetcher(bot_profile=self._bot_profile)
                 browser_result = await bf.fetch(url, proxy=proxy)
                 self._handoff_browser_cookies(url, browser_result)
                 return browser_result

@@ -18,9 +18,12 @@ import math
 import random
 import time
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from anansi.fetchers.base import BaseFetcher, FetchResult
+
+if TYPE_CHECKING:
+    from anansi.bot_profiles import BotProfile
 
 logger = logging.getLogger(__name__)
 
@@ -325,7 +328,10 @@ class BrowserFetcher(BaseFetcher):
         max_requests_per_context: int = 50,
         insecure: bool = False,
         sandbox: bool = True,
+        bot_profile: "str | BotProfile | None" = None,
     ) -> None:
+        from anansi.bot_profiles import get_profile
+        self._profile = get_profile(bot_profile)
         self._max_contexts = max_contexts
         self._headless = headless
         self._timeout = timeout
@@ -405,10 +411,18 @@ class BrowserFetcher(BaseFetcher):
 
             if ctx is None:
                 proxy_cfg = {"server": proxy} if proxy else None
-                ua = random.choice(_USER_AGENTS)
+                # A bot profile pins the UA to a crawler identity; otherwise
+                # rotate a realistic browser UA. Googlebot omits Accept-Language,
+                # so only send it on the default browser path.
                 viewport = random.choice(_VIEWPORTS)
                 hw = random.choice(_HW_CONCURRENCY_OPTIONS)
                 mem = random.choice(_DEVICE_MEMORY_OPTIONS)
+                if self._profile is not None:
+                    ua = self._profile.user_agent
+                    extra_http_headers = dict(self._profile.headers)
+                else:
+                    ua = random.choice(_USER_AGENTS)
+                    extra_http_headers = {"Accept-Language": "en-US,en;q=0.9"}
                 ctx = await self._browser.new_context(
                     user_agent=ua,
                     viewport=viewport,
@@ -418,7 +432,7 @@ class BrowserFetcher(BaseFetcher):
                     permissions=["geolocation"],
                     java_script_enabled=True,
                     ignore_https_errors=self._insecure,
-                    extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+                    extra_http_headers=extra_http_headers,
                 )
                 # Anti-bot stealth is skipped when the operator has disabled
                 # all evasion via ANANSI_DISABLE_ANTIBOT.
