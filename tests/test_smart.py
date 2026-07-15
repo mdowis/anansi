@@ -7,7 +7,7 @@ import pytest
 import respx
 
 from anansi.fetchers.base import FetchResult
-from anansi.fetchers.escalate import escalate_akamai
+from anansi.fetchers.escalate import escalate_akamai, escalate_protection
 from anansi.fetchers.smart import detect_akamai_block, needs_browser
 
 
@@ -108,6 +108,105 @@ async def test_ladder_disabled_returns_block_unchanged() -> None:
         disable_antibot=True,
     )
     assert out is blocked  # detected, but returned as-is for honest reporting
+
+
+# ── vendor-aware escalate_protection ladder ───────────────────────────────────
+
+async def test_protection_ladder_cf_challenge_escalates_to_browser() -> None:
+    """A CF challenge (arrives as 503, not ok) must escalate straight to the
+    browser without an impersonated retry, and without gating on result.ok."""
+    challenge = _r(
+        503, "Just a moment... cf-turnstile __cf_chl",
+        headers={"server": "cloudflare", "cf-ray": "abc"},
+    )
+
+    async def _imp():  # pragma: no cover - CF skips the impersonated rung
+        raise AssertionError("CF challenge should not do an impersonated retry")
+
+    async def _browser():
+        return _r(200, "<html>solved</html>", via_browser=True)
+
+    out = await escalate_protection(
+        url="https://example.com/", initial=challenge,
+        retry_impersonated=_imp, browser_fetch=_browser,
+        disable_antibot=False,
+    )
+    assert out.status == 200 and out.via_browser
+
+
+async def test_protection_ladder_cf_hard_block_returns_without_browser() -> None:
+    """A CF hard block must NOT burn a browser attempt — return immediately."""
+    block = _r(
+        403,
+        "Sorry, you have been blocked. Error 1020. Cloudflare Ray ID: x",
+        headers={"server": "cloudflare"},
+    )
+
+    async def _never():  # pragma: no cover
+        raise AssertionError("hard block must not escalate")
+
+    out = await escalate_protection(
+        url="https://example.com/", initial=block,
+        retry_impersonated=_never, browser_fetch=_never,
+        disable_antibot=False,
+    )
+    assert out is block
+
+
+async def test_protection_ladder_akamai_regression() -> None:
+    """Akamai still runs impersonated retry → browser via the unified ladder."""
+    blocked = _r(403, "AkamaiGHost Reference #9", headers={"Server": "AkamaiGHost"})
+
+    async def _imp():
+        return _r(403, "Reference #9 still blocked", headers={"Server": "AkamaiGHost"})
+
+    async def _browser():
+        return _r(200, "<html>browser solved</html>", via_browser=True)
+
+    out = await escalate_protection(
+        url="https://example.com/", initial=blocked,
+        retry_impersonated=_imp, browser_fetch=_browser,
+        disable_antibot=False,
+    )
+    assert out.status == 200 and out.via_browser
+
+
+async def test_protection_ladder_datadome_escalates_to_browser() -> None:
+    """DataDome device-check → browser (with a sticky residential proxy
+    upstream), never an impersonated cold retry."""
+    dd = _r(
+        403, "please verify — captcha-delivery.com",
+        headers={"set-cookie": "datadome=abc; Path=/"},
+    )
+
+    async def _imp():  # pragma: no cover - DataDome skips impersonated retry
+        raise AssertionError("DataDome should not do an impersonated retry")
+
+    async def _browser():
+        return _r(200, "<html>ok</html>", via_browser=True)
+
+    out = await escalate_protection(
+        url="https://example.com/", initial=dd,
+        retry_impersonated=_imp, browser_fetch=_browser,
+        disable_antibot=False,
+    )
+    assert out.status == 200 and out.via_browser
+
+
+async def test_protection_ladder_disabled_returns_challenge_unchanged() -> None:
+    challenge = _r(
+        503, "Just a moment cf-turnstile", headers={"server": "cloudflare"}
+    )
+
+    async def _never():  # pragma: no cover
+        raise AssertionError("must not escalate under DISABLE_ANTIBOT")
+
+    out = await escalate_protection(
+        url="https://example.com/", initial=challenge,
+        retry_impersonated=_never, browser_fetch=_never,
+        disable_antibot=True,
+    )
+    assert out is challenge
 
 
 # ── single-shot integration: _fetch_one escalates a simulated Akamai 403 ──────

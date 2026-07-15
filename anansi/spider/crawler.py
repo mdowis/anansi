@@ -321,8 +321,10 @@ class Crawler:
         worker_timeout: float = 120.0,
         impersonate: str | None = None,
         bot_profile: str | None = None,
+        captcha_solver: Any | None = None,
     ) -> None:
         self._impersonate = impersonate
+        self._captcha_solver = captcha_solver
         # Optional crawler identity (e.g. "googlebot"): pins the UA on every
         # fetcher this crawler builds and makes robots.txt evaluate against the
         # profile's agent token.
@@ -368,6 +370,14 @@ class Crawler:
         # per request would make every request "cold" and behaviorally
         # blocked. LRU-bounded like the other per-domain caches.
         self._host_fetchers: OrderedDict[str, Any] = OrderedDict()
+        # One coherent persona per host, reused across the HTTP fetcher and any
+        # browser escalation so a site sees a single consistent identity rather
+        # than a fresh random fingerprint each layer. LRU-bounded like the rest.
+        from anansi.persona import Persona as _Persona
+        self._domain_personas: OrderedDict[str, _Persona] = OrderedDict()
+        # A single shared BrowserFetcher whose sticky session pools survive
+        # across requests (created lazily; closed in run()'s finally).
+        self._shared_browser: Any | None = None
         self._max_tracked_domains = 4096
         self._valid_items = 0
         self._invalid_items = 0
@@ -388,6 +398,9 @@ class Crawler:
         self._items_count = 0
         self._pages_fetched = 0
         self._start_time: float = 0.0
+        # Last protection classification seen by _do_fetch — used by proxy
+        # scoring to attribute outcomes to the detected vendor.
+        self._last_detection: Any | None = None
 
     @property
     def crawl_id(self) -> str:
@@ -516,6 +529,14 @@ class Crawler:
                     pass
             self._host_fetchers.clear()
 
+            # Close the shared BrowserFetcher (and its sticky session pools).
+            if self._shared_browser is not None:
+                try:
+                    await self._shared_browser.close()
+                except Exception:
+                    pass
+                self._shared_browser = None
+
             # Requeue any URLs left in 'processing' state after abnormal exit
             queue2 = SQLiteQueue(self._crawl_id, self._db_path, canonicalize=self._canonicalize_urls)
             await queue2.requeue_stale()
@@ -635,22 +656,42 @@ class Crawler:
                 jitter = random.uniform(0, self._delay_jitter)
                 await asyncio.sleep(self._delay + jitter)
 
-                proxy = self._proxy_manager.next() if self._proxy_manager else None
+                # Prefer a proxy with a track record against this target.
+                self._last_detection = None
+                proxy = (
+                    self._proxy_manager.next(domain=domain)
+                    if self._proxy_manager else None
+                )
                 result = await self._do_fetch(url, proxy=proxy, meta=meta)
+
+                # Attribute the outcome to the detected vendor (set by _do_fetch)
+                # so future selections learn which proxies beat which vendors.
+                _det = self._last_detection
+                _vendor = getattr(getattr(_det, "vendor", None), "value", None)
+                _hard_block = bool(getattr(_det, "is_hard_block", False))
 
                 # 401/403 = IP-level auth block — rotate proxy but don't penalise it
                 if result.status in (401, 403) and self._proxy_manager and proxy:
                     logger.info(
                         "Auth failure %d at %s — rotating proxy without penalty", result.status, url
                     )
+                    # Record the block against this proxy/target (informs future
+                    # scoring) but do not add a quarantine-counting failure.
+                    if _hard_block:
+                        self._proxy_manager.report_failure(
+                            proxy, domain=domain, vendor=_vendor,
+                            hard_block=True, penalize=False,
+                        )
                     await queue.increment_retry(url, self._max_url_retries)
                     await self._domain_throttle.record_result(url, result.status)
                     return
 
                 if proxy and result.ok:
-                    self._proxy_manager.report_success(proxy)
+                    self._proxy_manager.report_success(proxy, domain=domain, vendor=_vendor)
                 elif proxy and result.status >= 500:
-                    self._proxy_manager.report_failure(proxy)
+                    self._proxy_manager.report_failure(
+                        proxy, domain=domain, vendor=_vendor, hard_block=_hard_block
+                    )
 
                 # Circuit breaker accounting
                 if result.ok or result.status in (301, 302, 304):
@@ -796,6 +837,51 @@ class Crawler:
                 if self._proxy_manager and proxy:
                     self._proxy_manager.report_failure(proxy)
 
+    def _persona_for(self, domain: str):
+        """Return the coherent persona bound to *domain*, creating one on first
+        contact. Shared by the HTTP fetcher and browser escalations so identity
+        surfaces stay consistent across layers."""
+        from anansi.persona import build_persona
+
+        persona = self._domain_personas.get(domain)
+        if persona is None:
+            persona = build_persona()
+            self._domain_personas[domain] = persona
+            while len(self._domain_personas) > self._max_tracked_domains:
+                self._domain_personas.popitem(last=False)
+        else:
+            self._domain_personas.move_to_end(domain)
+        return persona
+
+    async def _get_browser_fetcher(self):
+        """Return a shared BrowserFetcher whose sticky session pools persist
+        across requests. If the caller injected a BrowserFetcher, use it."""
+        from anansi.fetchers.browser import BrowserFetcher
+
+        if isinstance(self._fetcher, BrowserFetcher):
+            return self._fetcher
+        if self._shared_browser is None:
+            self._shared_browser = BrowserFetcher(
+                bot_profile=self._bot_profile,
+                captcha_solver=self._captcha_solver,
+            )
+        return self._shared_browser
+
+    async def _browser_fetch_for(self, url: str, proxy: str | None):
+        """Run a browser fetch for *url* with the host's coherent persona and a
+        sticky session key derived from (domain, proxy, persona)."""
+        from anansi.fetchers.browser import make_session_key
+
+        domain = urlparse(url).netloc
+        persona = self._persona_for(domain)
+        bf = await self._get_browser_fetcher()
+        return await bf.fetch(
+            url,
+            proxy=proxy,
+            persona=persona,
+            session_key=make_session_key(domain, proxy, persona),
+        )
+
     async def _get_host_fetcher(self, url: str, cookies: dict[str, str]):
         """Return the per-host HTTPFetcher, creating (and warming up) it on
         first contact so the cookie jar persists across the crawl."""
@@ -809,7 +895,7 @@ class Crawler:
 
         fetcher = HTTPFetcher(
             cookies=cookies, impersonate=self._impersonate,
-            bot_profile=self._bot_profile,
+            bot_profile=self._bot_profile, persona=self._persona_for(host),
         )
         self._host_fetchers[host] = fetcher
         # LRU-evict, closing the evicted fetcher's client.
@@ -853,7 +939,7 @@ class Crawler:
         if fetcher is None:
             fetcher = HTTPFetcher(
                 cookies=self._cookies, impersonate=self._impersonate,
-                bot_profile=self._bot_profile,
+                bot_profile=self._bot_profile, persona=self._persona_for(host),
             )
             self._host_fetchers[host] = fetcher
         fetcher._session_cookies.update(cookies)
@@ -865,9 +951,7 @@ class Crawler:
 
         # Explicit browser flag — skip all auto-detection logic
         if use_browser:
-            from anansi.fetchers.browser import BrowserFetcher
-            fetcher = self._fetcher if isinstance(self._fetcher, BrowserFetcher) else BrowserFetcher(bot_profile=self._bot_profile)
-            result = await fetcher.fetch(url, proxy=proxy)
+            result = await self._browser_fetch_for(url, proxy)
             self._handoff_browser_cookies(url, result)
             return result
 
@@ -875,10 +959,8 @@ class Crawler:
 
         # Auto-browser: domain previously identified as JS-rendered (E1)
         if self._auto_browser and self._domain_needs_browser.get(domain):
-            from anansi.fetchers.browser import BrowserFetcher
             logger.debug("Domain %s cached as JS-rendered — using BrowserFetcher", domain)
-            bf = BrowserFetcher(bot_profile=self._bot_profile)
-            result = await bf.fetch(url, proxy=proxy)
+            result = await self._browser_fetch_for(url, proxy)
             self._handoff_browser_cookies(url, result)
             return result
 
@@ -914,15 +996,23 @@ class Crawler:
             url, proxy=proxy, headers=extra_headers or None, referer=referer
         )
 
-        # Graduated Akamai escalation (rung 1: impersonated retry through a
-        # freshly-warmed per-host session; rung 2: headless browser, which
-        # can run the sensor JS). Detection runs even under DISABLE_ANTIBOT
-        # but escalation does not. Proxy rotation remains the crawler's
-        # existing last rung (the 401/403 handler upstream).
-        from anansi.fetchers.escalate import DEFAULT_IMPERSONATE, escalate_akamai
-        from anansi.fetchers.smart import detect_akamai_block
+        # Vendor-aware escalation. Classify the response once, then follow the
+        # detected vendor's playbook (Cloudflare challenge → browser, CF hard
+        # block → return, Akamai → impersonated retry then browser, DataDome →
+        # browser). Detection runs even under DISABLE_ANTIBOT (honest status)
+        # but escalation does not. Do NOT gate on result.ok — CF challenges
+        # arrive as 403/503. Proxy rotation remains the crawler's last rung
+        # (the 401/403 handler upstream). A bare JS shell (vendor NONE) is left
+        # to the auto-browser branch below, which also caches the domain.
+        from anansi.fetchers.escalate import DEFAULT_IMPERSONATE, escalate_protection
+        from anansi.protection import ProtectionVendor, detect_protection
 
-        if detect_akamai_block(result.html, result.status, result.headers):
+        detection = detect_protection(
+            result.html, result.status, result.headers, result.cookies, url
+        )
+        self._last_detection = detection
+
+        if detection.vendor is not ProtectionVendor.NONE:
             async def _retry_impersonated():
                 # Clear the stale per-host jar so the retry re-warms and
                 # re-mints behavioral cookies under an impersonated session.
@@ -959,16 +1049,15 @@ class Crawler:
                 )
 
             async def _browser_fetch():
-                from anansi.fetchers.browser import BrowserFetcher
-                bf = BrowserFetcher(bot_profile=self._bot_profile)
-                return await bf.fetch(url, proxy=proxy)
+                return await self._browser_fetch_for(url, proxy)
 
-            result = await escalate_akamai(
+            result = await escalate_protection(
                 url=url,
                 initial=result,
                 retry_impersonated=_retry_impersonated,
                 browser_fetch=_browser_fetch,
                 disable_antibot=security.DISABLE_ANTIBOT,
+                detection=detection,
             )
             if result.via_browser:
                 self._handoff_browser_cookies(url, result)
@@ -985,9 +1074,7 @@ class Crawler:
                 self._domain_needs_browser[domain] = True
                 while len(self._domain_needs_browser) > self._max_tracked_domains:
                     self._domain_needs_browser.popitem(last=False)
-                from anansi.fetchers.browser import BrowserFetcher
-                bf = BrowserFetcher(bot_profile=self._bot_profile)
-                browser_result = await bf.fetch(url, proxy=proxy)
+                browser_result = await self._browser_fetch_for(url, proxy)
                 self._handoff_browser_cookies(url, browser_result)
                 return browser_result
 

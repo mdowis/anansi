@@ -380,12 +380,14 @@ async def _fetch_one(
             ) as fetcher:
                 result = await fetcher.fetch(url, proxy=proxy, timeout=timeout)
 
-            # Graduated Akamai escalation: impersonated retry → browser.
-            # Detection still runs under DISABLE_ANTIBOT (honest status) but
-            # does not escalate.
+            # Vendor-aware escalation: classify the response and follow the
+            # detected vendor's playbook (Cloudflare challenge → browser, CF
+            # hard block → return, Akamai → impersonated retry then browser,
+            # DataDome → browser). Detection still runs under DISABLE_ANTIBOT
+            # (honest status) but does not escalate.
             from anansi.fetchers.escalate import (
                 DEFAULT_IMPERSONATE,
-                escalate_akamai,
+                escalate_protection,
             )
 
             async def _retry_impersonated() -> Any:
@@ -402,7 +404,7 @@ async def _fetch_one(
                 ) as bf:
                     return await bf.fetch(url, proxy=proxy, timeout=timeout)
 
-            result = await escalate_akamai(
+            result = await escalate_protection(
                 url=url,
                 initial=result,
                 retry_impersonated=_retry_impersonated,

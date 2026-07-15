@@ -270,6 +270,117 @@ crawler = Crawler(MySpider, bot_profile="googlebot")
 > the UA does not place you on Google's network. Use responsibly and within the
 > site's Terms of Service.
 
+### Coherent personas (identity consistency)
+
+Anti-bot systems don't just read your `User-Agent` — they cross-check it against
+`navigator.platform`, screen size, viewport, WebGL vendor, hardware
+concurrency, language, and timezone. A macOS UA next to a `Win32` platform or a
+4K screen behind a phone UA is an instant tell. A **persona** bundles all of
+these into one internally consistent identity, and both the HTTP and browser
+fetchers drive their headers/fingerprint from the *same* persona.
+
+```python
+from anansi import build_persona
+from anansi.fetchers.http import HTTPFetcher
+from anansi.fetchers.browser import BrowserFetcher
+
+persona = build_persona(seed=42)          # deterministic with a seed
+http = HTTPFetcher(persona=persona)        # Accept-Language matches the UA
+browser = BrowserFetcher(persona=persona)  # viewport/screen/WebGL/timezone all agree
+```
+
+Without a persona, each fetcher builds one automatically. In a crawl, one
+coherent persona is bound per host and reused across the HTTP fetcher and any
+browser escalation, so a site sees a single stable identity rather than a fresh
+random fingerprint at every layer.
+
+### Vendor-aware detection & escalation
+
+A shared classifier (`anansi.protection.detect_protection`) identifies the
+protection **vendor** (Cloudflare, Akamai, DataDome) and **kind** (solvable
+challenge, hard block, CAPTCHA, or plain JS shell) from a single HTTP response —
+so the crawler can react *before* wasting a full browser challenge timeout:
+
+- **Cloudflare challenge** (arrives as 403/503) → escalate straight to a browser.
+- **Cloudflare hard block** (Error 1020, "you have been blocked") → returned
+  as-is; a browser on the same IP hits the same WAF rule, so it needs a cleaner
+  IP or residential proxy instead.
+- **Akamai** → impersonated TLS retry, then a browser that can run the sensor JS.
+- **DataDome** → browser, ideally behind a sticky residential proxy.
+
+```python
+from anansi import detect_protection
+
+d = detect_protection(html, status, headers, cookies)
+print(d.vendor, d.kind, d.needs_browser, d.is_hard_block)
+```
+
+### Sticky browser sessions
+
+Solving a Cloudflare challenge or minting an Akamai `_abck` cookie is expensive.
+`BrowserFetcher` can keep the browser context (and its earned cookies) alive per
+`(domain, proxy, persona)` instead of starting cold on every request, so a
+challenge-heavy domain is solved once and reused:
+
+```python
+result = await browser.fetch(url, session_key="shop.example.com|noproxy|<persona>")
+```
+
+The crawler derives this key automatically. Unrelated session keys never share
+state, and `force_fresh=True` (used after a challenge timeout) always bypasses
+reuse with a brand-new fingerprint.
+
+### Target-aware proxy scoring
+
+`ProxyManager` records which proxies actually *work* for which targets, not just
+whether they're alive. `next(domain=..., vendor=...)` then prefers proxies with
+a proven track record against that site/vendor, penalises ones recently
+hard-blocked there, and falls back to plain round-robin for cold targets.
+Reporting is backward compatible — `report_success`/`report_failure` still work
+with no extra arguments.
+
+```python
+pm.report_success(proxy, domain="shop.com", vendor="cloudflare")
+pm.report_failure(proxy, domain="shop.com", vendor="cloudflare", hard_block=True)
+best = pm.next(domain="shop.com", vendor="cloudflare")
+```
+
+### CAPTCHA solver hook
+
+CAPTCHA handling is an explicit, opt-in interface rather than hidden browser
+logic. By default Anansi is **detection-only**: it recognises reCAPTCHA,
+hCaptcha, Turnstile, DataDome, and FunCaptcha and surfaces them, but never
+attempts to solve. Pass a `CaptchaSolver` to attempt solving (manual queue,
+human-in-the-loop, or a commercial provider you wire up yourself):
+
+```python
+from anansi import CaptchaSolver, CaptchaResult, NullCaptchaSolver
+from anansi.fetchers.browser import BrowserFetcher
+
+class MySolver:                       # implements the CaptchaSolver protocol
+    async def solve(self, challenge) -> CaptchaResult:
+        ...                           # your provider / human loop here
+
+browser = BrowserFetcher(captcha_solver=MySolver())   # or NullCaptchaSolver()
+```
+
+An unsolved CAPTCHA returns the page as-is with `manual_required` set — it never
+loops forever. No solving provider ships with Anansi.
+
+### Limitations
+
+These features raise the bar on *browser and identity* fingerprinting; they do
+**not** manufacture source-IP authenticity.
+
+- Spoofing a UA/persona does not change your IP. Enterprise bot management
+  (Cloudflare Enterprise, DataDome) scores IP reputation before any solvable
+  challenge — datacenter IPs are often blocked outright.
+- Hard blocks still require a better IP (residential/ISP proxy) or a manual
+  solve path; no amount of fingerprint tuning bypasses them.
+- DataDome support is primarily detection plus a better proxy/session strategy,
+  not a guaranteed bypass.
+- Always operate within the target site's Terms of Service and the law.
+
 ### CLI
 
 ```bash

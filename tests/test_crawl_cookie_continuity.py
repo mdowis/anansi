@@ -100,6 +100,52 @@ async def test_handoff_noop_under_disable_antibot(
     assert "example.com" not in crawler._host_fetchers
 
 
+async def test_host_persona_shared_between_http_and_browser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The HTTP fetcher and any browser escalation for a host use one coherent
+    persona — a single identity across layers, not a fresh fingerprint each."""
+    monkeypatch.setattr(security, "DISABLE_ANTIBOT", True)  # skip warm-up GET
+    crawler = _make_crawler(tmp_path)
+
+    persona = crawler._persona_for("example.com")
+    fetcher = await crawler._get_host_fetcher("https://example.com/a", {})
+    assert fetcher._persona is persona
+    # A second lookup returns the same persona (stable per host).
+    assert crawler._persona_for("example.com") is persona
+
+
+async def test_browser_escalation_uses_persona_and_session_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Browser escalation threads the host persona and a sticky session key
+    derived from (domain, proxy, persona)."""
+    from anansi.fetchers.browser import make_session_key
+
+    crawler = _make_crawler(tmp_path)
+    captured: dict = {}
+
+    class _BF:
+        def __init__(self, **kwargs):
+            pass
+
+        async def fetch(self, url, **kwargs):
+            captured.update(kwargs)
+            return FetchResult(url=url, status=200, html="ok", via_browser=True)
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("anansi.fetchers.browser.BrowserFetcher", _BF)
+
+    result = await crawler._browser_fetch_for("https://example.com/x", None)
+    assert result.via_browser
+
+    persona = crawler._persona_for("example.com")
+    assert captured["persona"] is persona
+    assert captured["session_key"] == make_session_key("example.com", None, persona)
+
+
 async def test_referer_set_from_parent_in_crawl(tmp_path: Path) -> None:
     """A followed link must carry the parent page as its Referer."""
     seen_referers: dict[str, str] = {}

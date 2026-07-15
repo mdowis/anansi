@@ -20,6 +20,7 @@ from tenacity import (
 from anansi import security
 from anansi.bot_profiles import BotProfile, get_profile
 from anansi.fetchers.base import BaseFetcher, FetchResult
+from anansi.persona import Persona, build_persona
 from anansi.security import InvalidImpersonateError, is_url_safe_for_public_fetch, validate_impersonate
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,7 @@ def _build_headers(
     ua: str,
     extra: dict[str, str] | None = None,
     profile: "BotProfile | None" = None,
+    persona: "Persona | None" = None,
 ) -> dict[str, str]:
     if profile is not None:
         # A bot profile pins the UA and supplies its own (crawler-accurate)
@@ -92,10 +94,17 @@ def _build_headers(
             **profile.headers,
         }
     else:
+        # Persona-driven identity: the Accept-Language advertised here must
+        # agree with the UA/platform the same persona presents to the browser
+        # layer. Fall back to the legacy rotation only if no persona is set.
+        accept_language = (
+            persona.accept_language if persona is not None
+            else random.choice(_ACCEPT_LANGUAGES)
+        )
         headers = {
             "User-Agent": ua,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": random.choice(_ACCEPT_LANGUAGES),
+            "Accept-Language": accept_language,
             "Accept-Encoding": "gzip, deflate, br",
             "DNT": "1",
             "Connection": "keep-alive",
@@ -129,6 +138,8 @@ class HTTPFetcher(BaseFetcher):
         cookies: dict[str, str] | None = None,
         impersonate: str | None = None,
         bot_profile: str | BotProfile | None = None,
+        persona: Persona | None = None,
+        persona_seed: int | None = None,
         max_response_bytes: int = _DEFAULT_MAX_RESPONSE_BYTES,
     ) -> None:
         self._max_retries = max_retries
@@ -140,10 +151,18 @@ class HTTPFetcher(BaseFetcher):
         self._profile = get_profile(bot_profile)
         if self._profile is not None:
             self._rotate_ua = False
+            self._persona: Persona | None = None
             self._ua = self._profile.user_agent
         else:
-            self._rotate_ua = rotate_user_agents
-            self._ua = random.choice(_USER_AGENTS)
+            # Identity is now persona-driven: a coherent UA + Accept-Language
+            # bundle instead of independently-rotated fragments. An explicitly
+            # supplied persona (or seed) is pinned and never rotated; without
+            # one we build a persona and honour the legacy rotate flag (which
+            # now rotates the whole persona, keeping surfaces consistent).
+            self._explicit_persona = persona is not None or persona_seed is not None
+            self._persona = persona if persona is not None else build_persona(seed=persona_seed)
+            self._rotate_ua = rotate_user_agents and not self._explicit_persona
+            self._ua = self._persona.user_agent
         self._client: httpx.AsyncClient | None = None
         self._base_cookies = cookies or {}
         self._session_cookies: dict[str, str] = {}
@@ -176,7 +195,10 @@ class HTTPFetcher(BaseFetcher):
         **kwargs: Any,
     ) -> FetchResult:
         if self._rotate_ua:
-            self._ua = random.choice(_USER_AGENTS)
+            # Rotate the entire persona (not just the UA) so every surface
+            # stays mutually consistent across the rotation.
+            self._persona = build_persona()
+            self._ua = self._persona.user_agent
 
         # Inject a Referer only when the caller supplies one and has not
         # already set it explicitly. Akamai (and similar) score a missing /
@@ -187,7 +209,7 @@ class HTTPFetcher(BaseFetcher):
         if referer and not any(k.lower() == "referer" for k in extra):
             extra["Referer"] = referer
 
-        merged_headers = _build_headers(self._ua, extra, self._profile)
+        merged_headers = _build_headers(self._ua, extra, self._profile, self._persona)
 
         # Resolve effective TLS impersonation target. Per-request value wins
         # over the instance-level default; explicit None forces plain httpx

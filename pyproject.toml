@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "anansi-scraper"
-version = "0.1.0"
+version = "1.0.0"
 description = "Anansi — adaptive web scraping framework that learns from website changes"
 readme = "README.md"
 requires-python = ">=3.11"

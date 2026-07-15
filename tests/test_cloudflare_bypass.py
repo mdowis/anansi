@@ -282,6 +282,161 @@ async def test_wait_for_cloudflare_grace_period_resolves_iuam(monkeypatch) -> No
 
 # ── Stale-progress guard — early exit when challenge never moves ──────────────
 
+from pathlib import Path
+
+from anansi.fetchers.base import FetchResult
+from anansi.spider.crawler import Crawler
+from anansi.spider.spider import Spider
+
+
+class _NoopSpider(Spider):
+    name = "cf_escalation"
+    start_urls = ["https://cf.example/"]
+
+    async def parse(self, response):  # pragma: no cover - not exercised
+        return
+        yield
+
+
+class _StubFetcher:
+    """HTTP fetcher stub returning a fixed FetchResult."""
+
+    def __init__(self, result: FetchResult) -> None:
+        self._result = result
+
+    async def fetch(self, url: str, **kwargs) -> FetchResult:
+        return self._result
+
+    async def close(self) -> None:
+        pass
+
+
+def _cf_crawler(tmp_path: Path, http_result: FetchResult) -> Crawler:
+    return Crawler(
+        _NoopSpider,
+        fetcher=_StubFetcher(http_result),
+        respect_robots=False,
+        auto_browser=False,
+        db_path=tmp_path / "cf.db",
+        adaptive_rate_limiting=False,
+        delay=0.0,
+        delay_jitter=0.0,
+        domain_delay=0.0,
+    )
+
+
+async def test_crawler_escalates_cf_503_challenge_to_browser(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A 403/503 Cloudflare challenge from the HTTP path escalates to browser,
+    even though result.ok is False."""
+    from anansi import security
+    monkeypatch.setattr(security, "DISABLE_ANTIBOT", False)
+
+    challenge = FetchResult(
+        url="https://cf.example/", status=503,
+        html="Just a moment... cf-turnstile __cf_chl",
+        headers={"server": "cloudflare", "cf-ray": "abc"},
+    )
+    crawler = _cf_crawler(tmp_path, challenge)
+
+    browser_result = FetchResult(
+        url="https://cf.example/", status=200,
+        html="<html>solved</html>", via_browser=True,
+    )
+
+    class _BF:
+        def __init__(self, **kwargs):
+            pass
+
+        async def fetch(self, url, **kwargs):
+            return browser_result
+
+    monkeypatch.setattr("anansi.fetchers.browser.BrowserFetcher", _BF)
+
+    result = await crawler._do_fetch("https://cf.example/", proxy=None, meta={})
+    assert result.status == 200
+    assert result.via_browser is True
+
+
+async def test_crawler_cf_hard_block_does_not_launch_browser(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A CF hard block is returned as-is; no browser is constructed (would hit
+    the same WAF rule on the same IP and burn the challenge timeout)."""
+    from anansi import security
+    monkeypatch.setattr(security, "DISABLE_ANTIBOT", False)
+
+    block = FetchResult(
+        url="https://cf.example/", status=403,
+        html="Sorry, you have been blocked. Error 1020. Cloudflare Ray ID: z",
+        headers={"server": "cloudflare"},
+    )
+    crawler = _cf_crawler(tmp_path, block)
+
+    launched = {"browser": False}
+
+    class _BF:
+        def __init__(self, **kwargs):
+            launched["browser"] = True
+
+        async def fetch(self, url, **kwargs):  # pragma: no cover
+            return FetchResult(url=url, status=200, html="x", via_browser=True)
+
+    monkeypatch.setattr("anansi.fetchers.browser.BrowserFetcher", _BF)
+
+    result = await crawler._do_fetch("https://cf.example/", proxy=None, meta={})
+    assert result is block
+    assert launched["browser"] is False
+
+
+async def test_cf_click_loop_exits_after_single_click(monkeypatch) -> None:
+    """Once a Turnstile widget is clicked, the frame scan must stop — it must
+    not go on to click a matching widget in every other frame."""
+    from anansi import security
+    monkeypatch.setattr(security, "DISABLE_ANTIBOT", False)
+
+    fetcher = BrowserFetcher(cf_wait_timeout=60.0)
+    fetcher._CF_GRACE_ITERS = 0
+
+    counter = {"clicks": 0}
+
+    class _El:
+        async def bounding_box(self):
+            return {"x": 10, "y": 10, "width": 20, "height": 20}
+
+        async def click(self):
+            counter["clicks"] += 1
+
+    class _Frame:
+        async def query_selector(self, sel):
+            return _El() if sel == ".cb-lb" else None
+
+    class _FakeCtx:
+        async def cookies(self):
+            return []
+
+    class _FakePage:
+        # Two frames both expose a clickable widget; only ONE should be clicked.
+        frames = [_Frame(), _Frame()]
+        context = _FakeCtx()
+
+        async def content(self):
+            return "<html>ok</html>" if counter["clicks"] else "Just a moment cf-turnstile __cf_chl"
+
+        class mouse:
+            @staticmethod
+            async def move(x, y):
+                pass
+
+        @staticmethod
+        async def evaluate(script):
+            pass
+
+    await fetcher._wait_for_cloudflare(_FakePage())
+    assert counter["clicks"] == 1, "loop must click exactly once, then stop scanning"
+
+
 async def test_wait_for_cloudflare_no_progress_early_exit(monkeypatch) -> None:
     """If page content never changes and no Turnstile widget is found, the
     stale-progress guard fires early instead of burning the full timeout."""

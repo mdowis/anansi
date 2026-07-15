@@ -21,6 +21,14 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from anansi.fetchers.base import BaseFetcher, FetchResult
+from anansi.persona import Persona, build_persona
+# Canonical Cloudflare marker lists live in anansi.protection so the HTTP path,
+# browser path, and crawler all classify identically. protection.py imports
+# fetchers.smart lazily, so importing it here forms no cycle.
+from anansi.protection import (
+    CLOUDFLARE_BLOCK_MARKERS as _CF_BLOCK_MARKERS,
+    CLOUDFLARE_CHALLENGE_MARKERS as _CF_CHALLENGE_MARKERS,
+)
 
 if TYPE_CHECKING:
     from anansi.bot_profiles import BotProfile
@@ -60,11 +68,14 @@ _STEALTH_JS = """
   Object.defineProperty(navigator, 'plugins', { get: () => pluginArray });
 
   // 3. Languages
-  Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+  Object.defineProperty(navigator, 'languages', { get: () => __ANANSI_LANGUAGES__ });
 
-  // 4. Hardware concurrency & device memory (realistic desktop values)
-  Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-  try { Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 }); } catch(_) {}
+  // 3b. Platform (kept consistent with the persona's UA)
+  try { Object.defineProperty(navigator, 'platform', { get: () => '__ANANSI_PLATFORM__' }); } catch(_) {}
+
+  // 4. Hardware concurrency & device memory (persona-consistent values)
+  Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => __ANANSI_HW__ });
+  try { Object.defineProperty(navigator, 'deviceMemory', { get: () => __ANANSI_MEM__ }); } catch(_) {}
 
   // 5. Chrome runtime object (expected by fingerprint checks)
   if (!window.chrome) {
@@ -94,18 +105,18 @@ _STEALTH_JS = """
     return ctx;
   };
 
-  // 7. WebGL vendor/renderer noise
+  // 7. WebGL vendor/renderer (persona-consistent)
   const origGetParam = WebGLRenderingContext.prototype.getParameter;
   WebGLRenderingContext.prototype.getParameter = function (param) {
-    if (param === 37445) return 'Intel Inc.';
-    if (param === 37446) return 'Intel Iris OpenGL Engine';
+    if (param === 37445) return '__ANANSI_WEBGL_VENDOR__';
+    if (param === 37446) return '__ANANSI_WEBGL_RENDERER__';
     return origGetParam.call(this, param);
   };
   try {
     const origGetParam2 = WebGL2RenderingContext.prototype.getParameter;
     WebGL2RenderingContext.prototype.getParameter = function (param) {
-      if (param === 37445) return 'Intel Inc.';
-      if (param === 37446) return 'Intel Iris OpenGL Engine';
+      if (param === 37445) return '__ANANSI_WEBGL_VENDOR__';
+      if (param === 37446) return '__ANANSI_WEBGL_RENDERER__';
       return origGetParam2.call(this, param);
     };
   } catch(_) {}
@@ -117,10 +128,10 @@ _STEALTH_JS = """
     return origQuery.apply(this, arguments);
   };
 
-  // 9. Screen dimensions consistent with a real desktop
-  Object.defineProperty(screen, 'width',     { get: () => 1920 });
-  Object.defineProperty(screen, 'height',    { get: () => 1080 });
-  Object.defineProperty(screen, 'colorDepth',{ get: () => 24 });
+  // 9. Screen dimensions consistent with the persona (never a fixed spoof)
+  Object.defineProperty(screen, 'width',     { get: () => __ANANSI_SCREEN_W__ });
+  Object.defineProperty(screen, 'height',    { get: () => __ANANSI_SCREEN_H__ });
+  Object.defineProperty(screen, 'colorDepth',{ get: () => __ANANSI_COLOR_DEPTH__ });
 
   // 10. iframe contentWindow.navigator.webdriver fix
   const origAttach = Element.prototype.attachShadow;
@@ -166,37 +177,32 @@ _STEALTH_JS = """
     });
   } catch(_) {}
 
-  // 14. Touch points — real desktops report 0; Playwright headless may not.
+  // 14. Touch points — persona-driven (desktops report 0, touch devices > 0).
   try {
-    Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
+    Object.defineProperty(navigator, 'maxTouchPoints', { get: () => __ANANSI_TOUCH__ });
   } catch(_) {}
 })();
 """
 
-# Cloudflare challenge indicators
-_CF_INDICATORS = [
-    "cf-turnstile",
-    "challenge-platform",
-    "cf_chl_opt",
-    "Cloudflare Ray ID",
-    "Please wait...",
-    "Just a moment",
-    "__cf_chl",
-]
+# Historical list names kept stable for callers/tests that import them.
+_CF_INDICATORS = list(_CF_CHALLENGE_MARKERS)
+_CF_BLOCK_INDICATORS = list(_CF_BLOCK_MARKERS)
 
-# Hard CF block pages (IP ban, WAF rule, rate limit).  These are NOT solvable
-# by waiting or clicking — they need a different IP or human intervention.
-# Distinct from the solvable challenge pages above.
-_CF_BLOCK_INDICATORS = [
-    "Sorry, you have been blocked",
-    "You are unable to access",
-    "This website is using a security service to protect itself",
-    "Error 1020",   # Access Denied (WAF rule)
-    "Error 1010",   # Your IP address is banned
-    "Error 1015",   # You are being rate limited
-    "Error 1012",   # IP address restricted
-    "Attention Required!",  # legacy CF block heading
-]
+
+def make_session_key(
+    domain: str,
+    proxy: str | None = None,
+    persona: Persona | None = None,
+) -> str:
+    """Build a sticky-session pool key from (domain, proxy, persona).
+
+    Two fetches that share a domain, egress proxy, and persona should reuse the
+    same browser context (and its earned cookies); changing any of the three is
+    a different identity and must not share state.
+    """
+    proxy_part = proxy or "noproxy"
+    persona_part = persona.persona_id if persona is not None else "default"
+    return f"{domain}|{proxy_part}|{persona_part}"
 
 
 def _bezier_points(
@@ -329,9 +335,20 @@ class BrowserFetcher(BaseFetcher):
         insecure: bool = False,
         sandbox: bool = True,
         bot_profile: "str | BotProfile | None" = None,
+        persona: Persona | None = None,
+        persona_seed: int | None = None,
+        captcha_solver: "Any | None" = None,
     ) -> None:
         from anansi.bot_profiles import get_profile
         self._profile = get_profile(bot_profile)
+        # Optional CAPTCHA solver (opt-in). Default: none configured, so a
+        # detected CAPTCHA is surfaced, never silently looped on.
+        self._captcha_solver = captcha_solver
+        self._last_captcha_result: Any | None = None
+        # A coherent persona drives every fingerprint surface (UA, viewport,
+        # screen, locale, timezone, WebGL, touch). Pinned when supplied;
+        # otherwise built once so all contexts share one consistent identity.
+        self._persona = persona if persona is not None else build_persona(seed=persona_seed)
         self._max_contexts = max_contexts
         self._headless = headless
         self._timeout = timeout
@@ -345,6 +362,12 @@ class BrowserFetcher(BaseFetcher):
         self._playwright = None
         self._context_semaphore: asyncio.Semaphore | None = None
         self._context_pool: asyncio.Queue | None = None  # holds (ctx, created_at, req_count)
+        # Sticky per-session pools, keyed by (registrable_domain, proxy,
+        # persona). A protected domain that earned a cf_clearance / _abck in
+        # one context keeps reusing that context (and its cookies) instead of
+        # starting cold on every checkout. The anonymous _context_pool above is
+        # still used when no session_key is supplied.
+        self._session_pools: dict[str, asyncio.Queue] = {}
         self._lock = asyncio.Lock()
 
     async def _ensure_browser(self) -> None:
@@ -368,36 +391,76 @@ class BrowserFetcher(BaseFetcher):
             self._context_semaphore = asyncio.Semaphore(self._max_contexts)
             self._context_pool: asyncio.Queue = asyncio.Queue(maxsize=self._max_contexts)
 
-    def _make_stealth_js(self, hw_concurrency: int, device_memory: int) -> str:
-        """Build the stealth script with randomised hardware values injected."""
-        return _STEALTH_JS.replace(
-            "{ get: () => 8 });",
-            f"{{ get: () => {hw_concurrency} }});",
-            1,
-        ).replace(
-            "{ get: () => 8 }); } catch(_) {}",
-            f"{{ get: () => {device_memory} }}); }} catch(_) {{}}",
-            1,
-        )
+    def _make_stealth_js(self, persona: Persona) -> str:
+        """Render the stealth script from a persona so every fingerprint
+        surface (languages, hardware, screen, WebGL, touch, platform) agrees
+        with the UA/viewport the same persona presents."""
+        # navigator.languages: derive from the persona's Accept-Language,
+        # dropping q-values (e.g. "en-US,en;q=0.9" → ['en-US', 'en']).
+        langs = [
+            part.split(";")[0].strip()
+            for part in persona.accept_language.split(",")
+            if part.strip()
+        ]
+        languages_js = "[" + ", ".join(f"'{lang}'" for lang in langs) + "]"
+
+        replacements = {
+            "__ANANSI_LANGUAGES__": languages_js,
+            "__ANANSI_PLATFORM__": persona.platform,
+            "__ANANSI_HW__": str(persona.hardware_concurrency),
+            "__ANANSI_MEM__": str(persona.device_memory),
+            "__ANANSI_WEBGL_VENDOR__": persona.webgl_vendor,
+            "__ANANSI_WEBGL_RENDERER__": persona.webgl_renderer,
+            "__ANANSI_SCREEN_W__": str(persona.screen["width"]),
+            "__ANANSI_SCREEN_H__": str(persona.screen["height"]),
+            "__ANANSI_COLOR_DEPTH__": str(persona.screen.get("color_depth", 24)),
+            "__ANANSI_TOUCH__": str(persona.max_touch_points),
+        }
+        js = _STEALTH_JS
+        for token, value in replacements.items():
+            js = js.replace(token, value)
+        return js
+
+    def _pool_for(self, session_key: str | None) -> "asyncio.Queue | None":
+        """Return the context pool for *session_key* (the anonymous pool when
+        None), creating a keyed pool on first use."""
+        if session_key is None:
+            return self._context_pool
+        pool = self._session_pools.get(session_key)
+        if pool is None:
+            pool = asyncio.Queue(maxsize=self._max_contexts)
+            self._session_pools[session_key] = pool
+        return pool
 
     @asynccontextmanager
     async def _get_context(
-        self, proxy: str | None = None, force_fresh: bool = False
+        self,
+        proxy: str | None = None,
+        force_fresh: bool = False,
+        persona: Persona | None = None,
+        session_key: str | None = None,
     ) -> AsyncIterator[Any]:
         await self._ensure_browser()
         assert self._context_semaphore is not None
         assert self._context_pool is not None
 
+        # A sticky session persists browser-earned state across checkouts; the
+        # key already encodes (domain, proxy, persona) so a keyed context can be
+        # reused even behind a proxy. The anonymous pool keeps its old rule:
+        # reuse only when there is no proxy override.
+        sticky = session_key is not None
+        pool = self._pool_for(session_key)
+
         async with self._context_semaphore:
-            # Try to reuse an idle context (only when no proxy override and not
-            # explicitly requesting a fresh one — the latter is used when a CF
-            # challenge timed out and we want a new fingerprint on retry).
+            # Try to reuse an idle context unless a fresh fingerprint was
+            # explicitly requested (force_fresh, used after a CF timeout).
             ctx = None
             created_at: float = 0.0
             req_count: int = 0
-            if proxy is None and not force_fresh:
+            can_reuse = not force_fresh and (sticky or proxy is None)
+            if can_reuse:
                 try:
-                    ctx, created_at, req_count = self._context_pool.get_nowait()
+                    ctx, created_at, req_count = pool.get_nowait()
                     # Retire contexts that exceeded their age or request-count limit
                     if (
                         time.monotonic() - created_at > self._context_max_age
@@ -411,25 +474,36 @@ class BrowserFetcher(BaseFetcher):
 
             if ctx is None:
                 proxy_cfg = {"server": proxy} if proxy else None
-                # A bot profile pins the UA to a crawler identity; otherwise
-                # rotate a realistic browser UA. Googlebot omits Accept-Language,
-                # so only send it on the default browser path.
-                viewport = random.choice(_VIEWPORTS)
-                hw = random.choice(_HW_CONCURRENCY_OPTIONS)
-                mem = random.choice(_DEVICE_MEMORY_OPTIONS)
+                # Every fingerprint surface comes from one coherent persona.
+                # force_fresh (used after a CF challenge times out) draws a
+                # brand-new persona so the retry presents a different, still
+                # internally-consistent identity.
+                if persona is not None:
+                    effective_persona = persona
+                elif force_fresh:
+                    effective_persona = build_persona()
+                else:
+                    effective_persona = self._persona
+                # A bot profile pins the UA to a crawler identity and sends that
+                # crawler's lean header set; otherwise the persona drives the UA
+                # and a matching Accept-Language.
                 if self._profile is not None:
                     ua = self._profile.user_agent
                     extra_http_headers = dict(self._profile.headers)
                 else:
-                    ua = random.choice(_USER_AGENTS)
-                    extra_http_headers = {"Accept-Language": "en-US,en;q=0.9"}
+                    ua = effective_persona.user_agent
+                    extra_http_headers = {
+                        "Accept-Language": effective_persona.accept_language
+                    }
                 ctx = await self._browser.new_context(
                     user_agent=ua,
-                    viewport=viewport,
+                    viewport=dict(effective_persona.viewport),
                     proxy=proxy_cfg,
-                    locale="en-US",
-                    timezone_id="America/New_York",
-                    permissions=["geolocation"],
+                    locale=effective_persona.locale,
+                    timezone_id=effective_persona.timezone_id,
+                    # No unconditional geolocation grant — a fresh browser has
+                    # granted no permissions, and always-granted geolocation is
+                    # itself a bot tell. Permissions are added per explicit need.
                     java_script_enabled=True,
                     ignore_https_errors=self._insecure,
                     extra_http_headers=extra_http_headers,
@@ -438,34 +512,44 @@ class BrowserFetcher(BaseFetcher):
                 # all evasion via ANANSI_DISABLE_ANTIBOT.
                 from anansi import security
                 if not security.DISABLE_ANTIBOT:
-                    await ctx.add_init_script(self._make_stealth_js(hw, mem))
+                    await ctx.add_init_script(self._make_stealth_js(effective_persona))
                     await ctx.add_init_script(_WEBRTC_BLOCK_JS)
                 created_at = time.monotonic()
                 req_count = 0
 
-            # Reset per-origin state on every checkout so cookies / permissions
-            # set by a previous fetch on this pooled context cannot leak into
-            # the next one (potentially for a different origin).
-            try:
-                await ctx.clear_cookies()
-            except Exception:
-                pass
-            try:
-                await ctx.clear_permissions()
-            except Exception:
-                pass
+            # Reset per-origin state on checkout so cookies / permissions from a
+            # previous *unrelated* fetch cannot leak into the next one. A sticky
+            # session is intentionally NOT cleared — that earned state (e.g. a
+            # solved cf_clearance) is the whole point of keeping it.
+            if not sticky:
+                try:
+                    await ctx.clear_cookies()
+                except Exception:
+                    pass
+                try:
+                    await ctx.clear_permissions()
+                except Exception:
+                    pass
 
+            poisoned = False
             try:
                 yield ctx
+            except Exception:
+                # A hard failure may have flagged this context's fingerprint —
+                # do not return it to the pool for the next request to inherit.
+                poisoned = True
+                raise
             finally:
                 req_count += 1
-                # force_fresh contexts are always closed after use — they were
-                # created for a single CF retry attempt and must not re-enter
-                # the pool (their fingerprint may already be flagged).
-                if proxy is None and not force_fresh:
+                # force_fresh and poisoned contexts are always closed. A sticky
+                # session returns to its keyed pool (even behind a proxy). The
+                # anonymous pool keeps the old rule: pool only when proxy-free.
+                if force_fresh or poisoned:
+                    await ctx.close()
+                elif sticky or proxy is None:
                     try:
                         # Preserve original created_at so age is not reset on reuse
-                        self._context_pool.put_nowait((ctx, created_at, req_count))
+                        pool.put_nowait((ctx, created_at, req_count))
                     except asyncio.QueueFull:
                         await ctx.close()
                 else:
@@ -582,6 +666,12 @@ class BrowserFetcher(BaseFetcher):
 
             now = time.monotonic()
             if now - _last_click_at >= 4.0:
+                # Track click state with an explicit flag. The previous
+                # `_last_click_at == now` check compared a pre-click timestamp
+                # to a post-click one — they are never equal, so the loop kept
+                # scanning every remaining frame after a successful click. A
+                # boolean makes the "stop after first click" exit deterministic.
+                clicked = False
                 try:
                     for frame in page.frames:
                         for sel in _CF_CLICK_SELECTORS:
@@ -596,8 +686,9 @@ class BrowserFetcher(BaseFetcher):
                                     await el.click()
                                     _last_click_at = time.monotonic()
                                     _last_change_at = time.monotonic()
+                                    clicked = True
                                     break
-                        if _last_click_at == now:
+                        if clicked:
                             break
                 except Exception:
                     pass
@@ -723,6 +814,45 @@ class BrowserFetcher(BaseFetcher):
                     "Optional browser action #%d (%r) failed — skipping: %s", i, atype, exc
                 )
 
+    async def _maybe_solve_captcha(self, page: Any, content: str) -> str:
+        """If a CAPTCHA is present and a solver is configured, invoke it once.
+
+        Detection-only by default (no solver → this is a no-op). A solver that
+        cannot solve returns ``manual_required`` and we surface the page as-is
+        rather than looping forever. On a solved result we re-read the (now
+        post-solve) page content.
+        """
+        if self._captcha_solver is None:
+            return content
+        from anansi import security
+        if security.DISABLE_ANTIBOT:
+            return content
+        from anansi.captcha import detect_captcha
+
+        challenge = detect_captcha(content, getattr(page, "url", None))
+        if challenge is None:
+            return content
+
+        try:
+            result = await self._captcha_solver.solve(challenge)
+        except Exception as exc:  # noqa: BLE001 - a solver must never crash a fetch
+            logger.warning("CAPTCHA solver raised for %s: %s", challenge.vendor.value, exc)
+            return content
+
+        self._last_captcha_result = result
+        if not result.solved:
+            logger.info(
+                "CAPTCHA (%s) not solved (%s) — returning page as-is",
+                challenge.vendor.value,
+                "manual required" if getattr(result, "manual_required", False) else result.error,
+            )
+            return content
+        logger.info("CAPTCHA (%s) reported solved — re-reading page", challenge.vendor.value)
+        try:
+            return await page.content()
+        except Exception:
+            return content
+
     async def fetch(
         self,
         url: str,
@@ -738,6 +868,8 @@ class BrowserFetcher(BaseFetcher):
         auto_consent: bool = True,
         capture_network: bool = False,
         capture_patterns: list[str] | None = None,
+        session_key: str | None = None,
+        persona: Persona | None = None,
         **kwargs: Any,
     ) -> FetchResult:
         t0 = time.perf_counter()
@@ -749,7 +881,12 @@ class BrowserFetcher(BaseFetcher):
         for _cf_attempt in range(2):
             _force_fresh = _cf_attempt > 0
             try:
-                async with self._get_context(proxy, force_fresh=_force_fresh) as ctx:
+                async with self._get_context(
+                    proxy,
+                    force_fresh=_force_fresh,
+                    persona=persona,
+                    session_key=session_key,
+                ) as ctx:
                     page = await ctx.new_page()
                     try:
                         if headers:
@@ -790,6 +927,10 @@ class BrowserFetcher(BaseFetcher):
                         if self._is_cloudflare_challenge(content):
                             await self._wait_for_cloudflare(page)
                             content = await page.content()
+
+                        # Surface any interactive CAPTCHA to the configured
+                        # solver (no-op when none is configured).
+                        content = await self._maybe_solve_captcha(page, content)
 
                         if auto_consent:
                             await _dismiss_cookie_consent(page)
@@ -927,10 +1068,15 @@ class BrowserFetcher(BaseFetcher):
                 await page.close()
 
     async def close(self) -> None:
+        pools = []
         if self._context_pool:
-            while not self._context_pool.empty():
-                ctx, _, _rc = await self._context_pool.get()
+            pools.append(self._context_pool)
+        pools.extend(self._session_pools.values())
+        for pool in pools:
+            while not pool.empty():
+                ctx, _, _rc = await pool.get()
                 await ctx.close()
+        self._session_pools.clear()
         if self._browser:
             await self._browser.close()
             self._browser = None
