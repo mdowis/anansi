@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-07-17
+
+### Changed
+
+- **Persistent SQLite connections**: `crawl_db()` / `selector_db()` now reuse a
+  cached connection per (event loop, database path) — opened, schema-initialised,
+  and migrated exactly once — instead of opening a fresh connection and replaying
+  the full schema on every operation. A single page fetch previously triggered many
+  connect-and-reinitialise cycles; these are now amortised to one. Call
+  `anansi.db.close_all()` at shutdown to release pooled connections (the MCP server
+  and CLI do this automatically).
+- **Shared headless browser in the MCP server**: browser-backed tools
+  (`fetch_url(use_browser=true)`, `screenshot_url`, and browser escalation) now reuse
+  a long-lived `BrowserFetcher` per bot profile instead of launching a fresh Chromium
+  on every call, eliminating repeated multi-second browser startups. Pooled browsers
+  are closed on server shutdown via a lifespan hook.
+
+Both changes are internal performance improvements with no public API change.
+
 ## [1.0.0] - 2026-07-15
 
 First stable release. From this version on, the public API surface exported from

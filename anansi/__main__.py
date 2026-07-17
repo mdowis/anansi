@@ -95,28 +95,33 @@ async def _cmd_fetch(args: argparse.Namespace) -> None:
 async def _cmd_crawls() -> None:
     from rich.console import Console
     from rich.table import Table
+    from anansi.db import close_all
     from anansi.spider.crawler import Crawler
 
-    crawls = await Crawler.list_crawls()
-    console = Console()
-    table = Table(title="Arachne Crawls")
-    table.add_column("Crawl ID", style="cyan")
-    table.add_column("Spider")
-    table.add_column("State")
-    table.add_column("Items")
-    table.add_column("Updated")
+    try:
+        crawls = await Crawler.list_crawls()
+        console = Console()
+        table = Table(title="Arachne Crawls")
+        table.add_column("Crawl ID", style="cyan")
+        table.add_column("Spider")
+        table.add_column("State")
+        table.add_column("Items")
+        table.add_column("Updated")
 
-    for c in crawls:
-        state_color = {"running": "green", "paused": "yellow", "finished": "blue", "error": "red"}.get(c["state"], "white")
-        table.add_row(
-            c["crawl_id"][:16] + "…",
-            c["spider_name"],
-            f"[{state_color}]{c['state']}[/]",
-            str(c["items_count"]),
-            c["updated_at"],
-        )
+        for c in crawls:
+            state_color = {"running": "green", "paused": "yellow", "finished": "blue", "error": "red"}.get(c["state"], "white")
+            table.add_row(
+                c["crawl_id"][:16] + "…",
+                c["spider_name"],
+                f"[{state_color}]{c['state']}[/]",
+                str(c["items_count"]),
+                c["updated_at"],
+            )
 
-    console.print(table)
+        console.print(table)
+    finally:
+        # Release the shared crawl-store connection before the event loop closes.
+        await close_all()
 
 
 if __name__ == "__main__":

@@ -2,14 +2,36 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
 
+import anansi.db as _db
 from anansi.db import crawl_db
 from anansi.spider.queue import SQLiteQueue
 
 CRAWL_ID = "test-crawl-0000"
+
+
+@pytest.fixture(autouse=True)
+async def _release_shared_resources():
+    """Close shared DB connections (and any pooled MCP browser fetchers) at the end
+    of every test.
+
+    ``db.py`` caches one ``aiosqlite`` connection per (event loop, path), and each
+    test runs on its own function-scoped loop (``asyncio_mode="auto"``). Leaking a
+    connection past its loop would let a later test whose loop reuses the same id
+    receive a connection bound to a dead loop and hang, so release them here.
+    """
+    yield
+    await _db.close_all()
+    server_mod = sys.modules.get("anansi.mcp_server.server")
+    if server_mod is not None:
+        try:
+            await server_mod._close_browser_fetchers()
+        except Exception:
+            pass
 
 
 @pytest.fixture

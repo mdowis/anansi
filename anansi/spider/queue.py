@@ -22,8 +22,10 @@ class SQLiteQueue:
     """
     Priority URL queue backed by a SQLite table.
 
-    All mutations are safe to call concurrently — each operation opens its
-    own short-lived connection (WAL mode allows concurrent reads + one write).
+    All mutations are safe to call concurrently. Each operation borrows the
+    shared connection cached by ``anansi.db`` (one per event loop + database
+    path, opened and schema-initialised once); aiosqlite serialises operations
+    on that connection's worker thread, and WAL mode allows concurrent readers.
     """
 
     def __init__(
