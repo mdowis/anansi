@@ -1,11 +1,18 @@
-"""Database initialisation and shared schema for selectors + crawl state."""
+"""Database initialisation and shared schema for selectors + crawl state.
+
+Connections are pooled: ``crawl_db()`` / ``selector_db()`` return a cached
+``aiosqlite`` connection — one per (event loop, database path) — that is opened,
+schema-initialised, and migrated exactly once and then reused by every caller,
+instead of opening a fresh connection and replaying the schema per operation.
+Call ``close_all()`` at shutdown to release them.
+"""
 
 from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Awaitable, Callable
 
 import aiosqlite
 
@@ -127,57 +134,144 @@ async def _init_schema(db: aiosqlite.Connection, schema: str) -> None:
         raise last_exc
 
 
+# ── Connection registry ──────────────────────────────────────────────────────
+# aiosqlite.Connection binds to the event loop it was created on, so the registry
+# is keyed by ``(running-loop id, resolved path)``: reusing a connection across
+# loops (e.g. pytest-asyncio's function-scoped loops) would raise "got Future
+# attached to a different loop". Within one loop a connection is opened once —
+# schema and migrations run a single time instead of on every operation — and
+# reused by every ``crawl_db``/``selector_db`` caller until ``close_all()``
+# (or ``close_db(path)``) releases it at shutdown.
+_connections: dict[tuple[int, str], aiosqlite.Connection] = {}
+_conn_locks: dict[int, asyncio.Lock] = {}
+
+
+def _loop_lock() -> asyncio.Lock:
+    """Return the connection-creation lock for the running loop, creating it on
+    first use. Runs synchronously (no ``await``) so the get-or-create can't race."""
+    loop_id = id(asyncio.get_running_loop())
+    lock = _conn_locks.get(loop_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _conn_locks[loop_id] = lock
+    return lock
+
+
+async def _get_connection(
+    resolved_path: Path,
+    schema: str,
+    migrate: Callable[[aiosqlite.Connection], Awaitable[None]] | None,
+) -> aiosqlite.Connection:
+    """Return the cached, once-initialised connection for *resolved_path* on the
+    running loop, creating it (schema + optional migrations) on first use."""
+    key = (id(asyncio.get_running_loop()), str(resolved_path))
+    conn = _connections.get(key)  # fast path: no await between check and use
+    if conn is not None:
+        return conn
+    async with _loop_lock():
+        conn = _connections.get(key)  # re-check under the creation lock
+        if conn is not None:
+            return conn
+        resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = await aiosqlite.connect(resolved_path)
+        conn.row_factory = aiosqlite.Row
+        await _init_schema(conn, schema)  # runs exactly once per (loop, path)
+        if migrate is not None:
+            await migrate(conn)
+        _connections[key] = conn
+        return conn
+
+
+async def _run_crawl_migrations(db: aiosqlite.Connection) -> None:
+    """Idempotent migrations for existing crawl databases, run once per connection
+    (each wrapped so an already-applied column/table is a no-op)."""
+    # Migrate: add retry_count to url_queue for existing databases
+    try:
+        await db.execute(
+            "ALTER TABLE url_queue ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"
+        )
+        await db.commit()
+    except Exception:
+        pass  # column already exists
+    # Migrate: add content_hash to visited_urls for existing databases
+    try:
+        await db.execute("ALTER TABLE visited_urls ADD COLUMN content_hash TEXT")
+        await db.commit()
+    except Exception:
+        pass  # column already exists
+    # Migrate: create url_cache table for incremental crawling
+    try:
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS url_cache (
+                url           TEXT PRIMARY KEY,
+                etag          TEXT,
+                last_modified TEXT,
+                content_hash  TEXT,
+                last_fetched  REAL NOT NULL DEFAULT 0.0
+            )
+            """
+        )
+        await db.commit()
+    except Exception:
+        pass
+
+
 @asynccontextmanager
 async def selector_db(path: Path | None = None) -> AsyncIterator[aiosqlite.Connection]:
+    """Yield the shared selector-store connection for *path*.
+
+    The connection is opened and schema-initialised once per (event loop, path)
+    and reused across calls; it is **not** closed on context exit. Call
+    ``close_all()`` (or ``close_db(path)``) at shutdown to release it.
+    """
     db_path = path or DATA_DIR / "selectors.db"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        await _init_schema(db, _SELECTOR_SCHEMA)
-        yield db
+    yield await _get_connection(db_path, _SELECTOR_SCHEMA, migrate=None)
 
 
 @asynccontextmanager
 async def crawl_db(path: Path | str | None = None) -> AsyncIterator[aiosqlite.Connection]:
+    """Yield the shared crawl-store connection for *path*.
+
+    Opened, schema-initialised, and migrated once per (event loop, path), then
+    reused; **not** closed on context exit — call ``close_all()`` at shutdown.
+    """
     # SECURITY: ``path`` is treated as trusted library input. Do NOT forward
     # untrusted strings (e.g. MCP-client-controlled values) here — confine them
     # to a sandbox via ``anansi.security.confine_to_dir`` first.
     db_path = Path(path) if path else DATA_DIR / "crawls.db"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        await _init_schema(db, _CRAWL_SCHEMA)
-        # Migrate: add retry_count to url_queue for existing databases
+    yield await _get_connection(db_path, _CRAWL_SCHEMA, migrate=_run_crawl_migrations)
+
+
+async def close_db(path: Path | str | None = None) -> None:
+    """Close and de-register the connection for *path* on the running loop."""
+    if path is None:
+        return
+    key = (id(asyncio.get_running_loop()), str(Path(path)))
+    conn = _connections.pop(key, None)
+    if conn is not None:
         try:
-            await db.execute(
-                "ALTER TABLE url_queue ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"
-            )
-            await db.commit()
-        except Exception:
-            pass  # column already exists
-        # Migrate: add content_hash to visited_urls for existing databases
-        try:
-            await db.execute("ALTER TABLE visited_urls ADD COLUMN content_hash TEXT")
-            await db.commit()
-        except Exception:
-            pass  # column already exists
-        # Migrate: create url_cache table for incremental crawling
-        try:
-            await db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS url_cache (
-                    url           TEXT PRIMARY KEY,
-                    etag          TEXT,
-                    last_modified TEXT,
-                    content_hash  TEXT,
-                    last_fetched  REAL NOT NULL DEFAULT 0.0
-                )
-                """
-            )
-            await db.commit()
+            await conn.close()
         except Exception:
             pass
-        yield db
+
+
+async def close_all() -> None:
+    """Close every connection created on the current running loop and drop it from
+    the registry.
+
+    Only the loop that owns a connection may await its ``close()``, so this touches
+    just the current loop's entries. Safe to call more than once.
+    """
+    loop_id = id(asyncio.get_running_loop())
+    for key in [k for k in _connections if k[0] == loop_id]:
+        conn = _connections.pop(key, None)
+        if conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+    _conn_locks.pop(loop_id, None)
 
 
 async def init_all(data_dir: Path | None = None) -> None:

@@ -19,6 +19,7 @@ import sys
 import textwrap
 import uuid
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -191,8 +192,70 @@ def _cache_entry_bytes(chunks: list[str], meta: dict[str, Any]) -> int:
         len(str(k)) + len(str(v)) for k, v in meta.items()
     )
 
+
+# ── Shared browser-fetcher pool ──────────────────────────────────────────────
+# Launching Chromium is expensive, so BrowserFetcher instances are shared across
+# tool calls instead of built per call. ``bot_profile`` is baked into a fetcher at
+# construction (it drives the UA/header set) and cannot vary per fetch(), so the
+# pool is keyed by bot_profile; per-call timeout/proxy/etc. still go to fetch().
+# Pooled instances are closed by the server lifespan on shutdown. HTTPFetcher is
+# deliberately NOT pooled — its construction is cheap (no network until the first
+# fetch) and sharing it would clobber the rotating User-Agent under concurrency
+# and leak cookies across domains, regressing the anti-bot identity model.
+_browser_fetchers: dict[str | None, Any] = {}
+_fetcher_locks: dict[int, asyncio.Lock] = {}
+
+
+def _fetcher_lock() -> asyncio.Lock:
+    """Per-loop creation lock for the browser pool (synchronous get-or-create)."""
+    loop_id = id(asyncio.get_running_loop())
+    lock = _fetcher_locks.get(loop_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _fetcher_locks[loop_id] = lock
+    return lock
+
+
+async def _get_browser_fetcher(bot_profile: str | None) -> Any:
+    """Return the shared BrowserFetcher for *bot_profile*, constructing it (and,
+    lazily on first fetch, its Chromium) exactly once per profile."""
+    bf = _browser_fetchers.get(bot_profile)  # fast path: no await before use
+    if bf is not None:
+        return bf
+    async with _fetcher_lock():
+        bf = _browser_fetchers.get(bot_profile)  # re-check under the lock
+        if bf is None:
+            from anansi.fetchers.browser import BrowserFetcher
+            bf = BrowserFetcher(bot_profile=bot_profile)
+            _browser_fetchers[bot_profile] = bf
+        return bf
+
+
+async def _close_browser_fetchers() -> None:
+    """Close every pooled BrowserFetcher (Chromium + context/session pools)."""
+    for bf in list(_browser_fetchers.values()):
+        try:
+            await bf.close()
+        except Exception:
+            pass
+    _browser_fetchers.clear()
+    _fetcher_locks.clear()
+
+
+@asynccontextmanager
+async def _lifespan(_server: FastMCP):
+    """Server lifespan: release shared browsers and DB connections on shutdown."""
+    try:
+        yield {}
+    finally:
+        await _close_browser_fetchers()
+        from anansi.db import close_all
+        await close_all()
+
+
 mcp = FastMCP(
     name="anansi",
+    lifespan=_lifespan,
     instructions=textwrap.dedent("""
         Anansi is an adaptive web scraping framework.
 
@@ -360,19 +423,17 @@ async def _fetch_one(
         chunks, meta = cached[0], cached[1]
     else:
         if use_browser:
-            from anansi.fetchers.browser import BrowserFetcher
-            async with BrowserFetcher(
-                timeout=timeout, bot_profile=bot_profile
-            ) as fetcher:
-                result = await fetcher.fetch(
-                    url,
-                    proxy=proxy,
-                    wait_for=wait_for_selector,
-                    timeout=timeout,
-                    actions=actions,
-                    capture_network=capture_network,
-                    capture_patterns=capture_patterns,
-                )
+            # Shared per-bot_profile browser (Chromium launched once, not per call).
+            fetcher = await _get_browser_fetcher(bot_profile)
+            result = await fetcher.fetch(
+                url,
+                proxy=proxy,
+                wait_for=wait_for_selector,
+                timeout=timeout,
+                actions=actions,
+                capture_network=capture_network,
+                capture_patterns=capture_patterns,
+            )
         else:
             from anansi.fetchers.http import HTTPFetcher
             async with HTTPFetcher(
@@ -398,11 +459,8 @@ async def _fetch_one(
                     return await f2.fetch(url, proxy=proxy, timeout=timeout)
 
             async def _browser_fetch() -> Any:
-                from anansi.fetchers.browser import BrowserFetcher
-                async with BrowserFetcher(
-                    timeout=timeout, bot_profile=bot_profile
-                ) as bf:
-                    return await bf.fetch(url, proxy=proxy, timeout=timeout)
+                bf = await _get_browser_fetcher(bot_profile)
+                return await bf.fetch(url, proxy=proxy, timeout=timeout)
 
             result = await escalate_protection(
                 url=url,
@@ -1415,19 +1473,16 @@ async def screenshot_url(
         except PathOutsideSandboxError as exc:
             return {"error": f"screenshot path rejected: {exc}"}
 
-    from anansi.fetchers.browser import BrowserFetcher
-    bf = BrowserFetcher()
-    try:
-        return await bf.screenshot(
-            url,
-            selector=selector,
-            full_page=full_page,
-            path=confined_path,
-            proxy=proxy,
-            timeout=timeout,
-        )
-    finally:
-        await bf.close()
+    # Shared browser (no bot_profile → key None); lifecycle owned by the pool.
+    bf = await _get_browser_fetcher(None)
+    return await bf.screenshot(
+        url,
+        selector=selector,
+        full_page=full_page,
+        path=confined_path,
+        proxy=proxy,
+        timeout=timeout,
+    )
 
 
 # ── Tool: train_selector ──────────────────────────────────────────────────────

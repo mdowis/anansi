@@ -238,16 +238,15 @@ async def test_fetch_one_escalates_akamai_403_to_browser(
             )
         )
 
+        # The MCP server now reuses a pooled BrowserFetcher (no ``async with``),
+        # so the constructor returns the instance whose fetch() is driven here.
         bf_instance = MagicMock()
         bf_instance.fetch = AsyncMock(return_value=browser_result)
         bf_instance.close = AsyncMock()
-        bf_cm = MagicMock()
-        bf_cm.__aenter__ = AsyncMock(return_value=bf_instance)
-        bf_cm.__aexit__ = AsyncMock(return_value=False)
 
         with patch("anansi.mcp_server.server._validate_url"), \
                 patch("anansi.fetchers.browser.BrowserFetcher",
-                      return_value=bf_cm):
+                      return_value=bf_instance):
             res = await srv._fetch_one("https://example.com/")
 
     assert res["status"] == 200
