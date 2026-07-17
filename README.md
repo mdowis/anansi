@@ -652,7 +652,7 @@ anansi/
 ├── utils/
 │   └── url.py           # canonicalize_url — tracking param stripping, param sort
 └── mcp_server/
-    └── server.py        # FastMCP server — 12 LLM-callable tools
+    └── server.py        # FastMCP server — 17 LLM-callable tools
 ```
 
 ---
