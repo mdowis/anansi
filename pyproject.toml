@@ -5,11 +5,11 @@ build-backend = "hatchling.build"
 [project]
 name = "anansi-scraper"
 version = "1.0.0"
-description = "Anansi — adaptive web scraping framework that learns from website changes"
+description = "Anansi — self-healing, vendor-aware web-scraping framework for hostile sites, driveable by any LLM over MCP"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
-keywords = ["scraping", "crawling", "web", "adaptive", "playwright", "mcp"]
+keywords = ["scraping", "crawling", "web", "adaptive", "anti-bot", "stealth", "playwright", "mcp"]
 authors = [{ name = "Matt Dowis" }]
 
 dependencies = [
