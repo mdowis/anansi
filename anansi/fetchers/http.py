@@ -164,6 +164,10 @@ class HTTPFetcher(BaseFetcher):
             self._rotate_ua = rotate_user_agents and not self._explicit_persona
             self._ua = self._persona.user_agent
         self._client: httpx.AsyncClient | None = None
+        # Reused across requests so proxied fetches and impersonated retries keep
+        # TCP/TLS connections alive instead of paying a fresh handshake each time.
+        self._proxy_clients: dict[str, httpx.AsyncClient] = {}
+        self._impersonate_sessions: dict[str, Any] = {}
         self._base_cookies = cookies or {}
         self._session_cookies: dict[str, str] = {}
         self._impersonate = impersonate
@@ -331,34 +335,37 @@ class HTTPFetcher(BaseFetcher):
                 # allow_redirects=False so every Location is re-validated by
                 # the shared SSRF-checked redirect loop (parity with the httpx
                 # path; impersonate must not weaken the SSRF guard).
-                async with AsyncSession(
-                    impersonate=impersonate,
-                    allow_redirects=False,
-                ) as session:
-                    cur_url, cur_method, cur_body = url, method, body
-                    redirect_count = 0
-                    while True:
-                        resp = await session.request(
-                            method=cur_method,
-                            url=cur_url,
-                            headers=headers,
-                            data=cur_body,
-                            cookies=request_cookies or None,
-                            proxies=proxies,
-                            timeout=timeout,
-                        )
-                        nxt = self._resolve_redirect(
-                            status=resp.status_code,
-                            resp_url=str(resp.url),
-                            location=resp.headers.get("location"),
-                            method=cur_method,
-                            body=cur_body,
-                            redirect_count=redirect_count,
-                        )
-                        if nxt is None:
-                            break
-                        cur_url, cur_method, cur_body = nxt
-                        redirect_count += 1
+                # Reuse one AsyncSession per impersonate target (created once,
+                # not per attempt) so the browser-TLS handshake isn't repaid on
+                # every request/retry. proxies + timeout are per-request args.
+                session = self._impersonate_sessions.get(impersonate)
+                if session is None:
+                    session = AsyncSession(impersonate=impersonate, allow_redirects=False)
+                    self._impersonate_sessions[impersonate] = session
+                cur_url, cur_method, cur_body = url, method, body
+                redirect_count = 0
+                while True:
+                    resp = await session.request(
+                        method=cur_method,
+                        url=cur_url,
+                        headers=headers,
+                        data=cur_body,
+                        cookies=request_cookies or None,
+                        proxies=proxies,
+                        timeout=timeout,
+                    )
+                    nxt = self._resolve_redirect(
+                        status=resp.status_code,
+                        resp_url=str(resp.url),
+                        location=resp.headers.get("location"),
+                        method=cur_method,
+                        body=cur_body,
+                        redirect_count=redirect_count,
+                    )
+                    if nxt is None:
+                        break
+                    cur_url, cur_method, cur_body = nxt
+                    redirect_count += 1
                 elapsed = time.perf_counter() - t0
 
                 if resp.status_code in _RETRYABLE_STATUSES:
@@ -403,16 +410,20 @@ class HTTPFetcher(BaseFetcher):
         """Fetch using httpx (standard path)."""
         client = await self._get_client()
 
-        # Rebuild client with proxy if needed (httpx doesn't support per-request proxy easily)
+        # httpx has no per-request proxy, so proxied fetches use a separate
+        # client — but pool one per proxy URL and reuse it (keep-alive / HTTP-2
+        # multiplexing) instead of building and closing one per request.
         if proxy:
-            transport = httpx.AsyncHTTPTransport(proxy=proxy)
-            fetch_client = httpx.AsyncClient(
-                http2=self._http2,
-                # Auto-redirect off — the loop below validates each hop.
-                follow_redirects=False,
-                timeout=httpx.Timeout(timeout),
-                transport=transport,
-            )
+            fetch_client = self._proxy_clients.get(proxy)
+            if fetch_client is None or fetch_client.is_closed:
+                fetch_client = httpx.AsyncClient(
+                    http2=self._http2,
+                    # Auto-redirect off — the loop below validates each hop.
+                    follow_redirects=False,
+                    timeout=httpx.Timeout(self._timeout),
+                    transport=httpx.AsyncHTTPTransport(proxy=proxy),
+                )
+                self._proxy_clients[proxy] = fetch_client
         else:
             fetch_client = client
 
@@ -498,9 +509,23 @@ class HTTPFetcher(BaseFetcher):
                 spa_state=_spa or None,
             )
         finally:
-            if proxy and fetch_client is not client:
-                await fetch_client.aclose()
+            # Proxy clients are pooled and reused, so they are NOT closed here —
+            # close() drains them at the end of the fetcher's life.
+            pass
 
     async def close(self) -> None:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
+        for pc in self._proxy_clients.values():
+            try:
+                if not pc.is_closed:
+                    await pc.aclose()
+            except Exception:
+                pass
+        self._proxy_clients.clear()
+        for sess in self._impersonate_sessions.values():
+            try:
+                await sess.close()
+            except Exception:
+                pass
+        self._impersonate_sessions.clear()

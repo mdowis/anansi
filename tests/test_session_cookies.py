@@ -97,6 +97,9 @@ class _FakeResp:
                  cookies=None):
         self.status_code = status
         self.text = text
+        # Real curl_cffi/httpx responses expose raw bytes; the fetcher sizes the
+        # body via len(resp.content).
+        self.content = text.encode("utf-8")
         self.headers = headers or {}
         self.url = url
         self.cookies = cookies or {}
