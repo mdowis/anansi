@@ -469,10 +469,8 @@ class Crawler:
 
                 url, callback, meta = entry
 
-                if await queue.is_visited(url):
-                    await queue.mark_done(url)
-                    continue
-
+                # No visited pre-check here: pop() already excludes visited URLs
+                # in its WHERE clause (single round-trip instead of two).
                 task = asyncio.create_task(
                     asyncio.wait_for(
                         self._fetch_and_parse(
