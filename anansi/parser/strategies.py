@@ -67,19 +67,28 @@ def strategy_attribute_fuzzy(
     if not wanted_classes:
         return []
 
+    # Memoize similarity per (wanted, candidate) pair: a page has thousands of
+    # elements but only dozens of distinct class names, so the same pair would
+    # otherwise be scored thousands of times.
+    ratio_cache: dict[tuple[str, str], float] = {}
+
+    def _ratio(wc: str, tc: str) -> float:
+        if wc == tc:
+            return 1.0
+        key = (wc, tc)
+        cached = ratio_cache.get(key)
+        if cached is None:
+            cached = difflib.SequenceMatcher(None, wc, tc).ratio()
+            ratio_cache[key] = cached
+        return cached
+
     results: list[tuple[Tag, float]] = []
     for tag in soup.find_all(True):
         tag_classes: list[str] = tag.get("class", [])
         if not tag_classes:
             continue
         # Score each wanted class against the tag's classes
-        scores = []
-        for wc in wanted_classes:
-            best = max(
-                difflib.SequenceMatcher(None, wc, tc).ratio()
-                for tc in tag_classes
-            )
-            scores.append(best)
+        scores = [max(_ratio(wc, tc) for tc in tag_classes) for wc in wanted_classes]
         avg_score = sum(scores) / len(scores)
         if avg_score >= 0.6:
             results.append((tag, avg_score * 0.85))  # cap below text-match
@@ -149,9 +158,8 @@ def strategy_xpath_fallback(
             else:
                 xpath = f"//{tag_part}"
 
-        html = str(soup)
-        tree = etree.fromstring(html.encode(), etree.HTMLParser())
-        lxml_elements = tree.xpath(xpath)
+        from anansi.parser.structured import lxml_tree
+        lxml_elements = lxml_tree(soup).xpath(xpath)
 
         results: list[tuple[Tag, float]] = []
         for el in lxml_elements[:5]:

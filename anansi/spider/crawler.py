@@ -20,7 +20,7 @@ import logging
 import random
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from enum import Enum
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -46,47 +46,39 @@ logger = logging.getLogger(__name__)
 _MAX_ROBOTS_CRAWL_DELAY = 300.0
 
 
-class _LRUDefault(dict):
+class _LRUDefault(OrderedDict):
     """A defaultdict-with-LRU-eviction. Missing-key reads insert the default
     factory's value; every access promotes the entry; the dict caps at
     ``max_entries`` and drops the least-recently-used.
+
+    Ordering is kept by the underlying ``OrderedDict`` so promotion is O(1)
+    (``move_to_end``) and eviction is O(1) (``popitem(last=False)``) — no linear
+    scan per access.
     """
 
     def __init__(self, default_factory, *, max_entries: int) -> None:
         super().__init__()
         self._factory = default_factory
         self._max = max_entries
-        self._order: deque = deque()
 
     def __missing__(self, key):
         value = self._factory()
         # Insert via __setitem__ so eviction logic runs.
-        self.__setitem__(key, value)
+        self[key] = value
         return value
 
     def __getitem__(self, key):
         if super().__contains__(key):
             # Promote to most-recently-used.
-            try:
-                self._order.remove(key)
-            except ValueError:
-                pass
-            self._order.append(key)
+            self.move_to_end(key)
             return super().__getitem__(key)
         return self.__missing__(key)
 
     def __setitem__(self, key, value) -> None:
-        existed = super().__contains__(key)
         super().__setitem__(key, value)
-        if existed:
-            try:
-                self._order.remove(key)
-            except ValueError:
-                pass
-        self._order.append(key)
-        while len(self._order) > self._max:
-            oldest = self._order.popleft()
-            super().pop(oldest, None)
+        self.move_to_end(key)
+        while len(self) > self._max:
+            self.popitem(last=False)
 
     def get(self, key, default=None):  # type: ignore[override]
         if super().__contains__(key):
@@ -382,8 +374,6 @@ class Crawler:
         self._valid_items = 0
         self._invalid_items = 0
         # Adaptive concurrency: sliding window of last 50 outcomes (True = error)
-        self._outcome_window: deque = deque(maxlen=50)
-        self._current_concurrency = concurrency
         self._robots: Any | None = None
         if respect_robots:
             from anansi.robots import RobotsCache
@@ -479,10 +469,8 @@ class Crawler:
 
                 url, callback, meta = entry
 
-                if await queue.is_visited(url):
-                    await queue.mark_done(url)
-                    continue
-
+                # No visited pre-check here: pop() already excludes visited URLs
+                # in its WHERE clause (single round-trip instead of two).
                 task = asyncio.create_task(
                     asyncio.wait_for(
                         self._fetch_and_parse(
@@ -662,7 +650,15 @@ class Crawler:
                     self._proxy_manager.next(domain=domain)
                     if self._proxy_manager else None
                 )
-                result = await self._do_fetch(url, proxy=proxy, meta=meta)
+                # Read the url_cache row once: _do_fetch uses it for conditional-
+                # GET headers and the content-hash check below reuses it (nothing
+                # updates the row in between).
+                url_cache_row = (
+                    await self._get_url_cache(url) if self._conditional_get else None
+                )
+                result = await self._do_fetch(
+                    url, proxy=proxy, meta=meta, cached=url_cache_row
+                )
 
                 # Attribute the outcome to the detected vendor (set by _do_fetch)
                 # so future selections learn which proxies beat which vendors.
@@ -699,24 +695,6 @@ class Crawler:
                 elif result.status >= 500 or result.status == 0:
                     await self._circuit_breaker.record_failure(url)
 
-                # Adaptive concurrency: track error rate over last 50 fetches
-                is_error = not result.ok and result.status not in (301, 302, 304)
-                self._outcome_window.append(is_error)
-                if len(self._outcome_window) >= 20:
-                    error_rate = sum(self._outcome_window) / len(self._outcome_window)
-                    if error_rate > 0.40 and self._current_concurrency > 1:
-                        self._current_concurrency -= 1
-                        logger.info(
-                            "Adaptive concurrency: high error rate %.0f%% — reducing to %d",
-                            error_rate * 100, self._current_concurrency,
-                        )
-                    elif error_rate < 0.10 and self._current_concurrency < self._concurrency:
-                        self._current_concurrency += 1
-                        logger.debug(
-                            "Adaptive concurrency: low error rate %.0f%% — restoring to %d",
-                            error_rate * 100, self._current_concurrency,
-                        )
-
                 # Adaptive rate limiting: record outcome for this domain (E2)
                 await self._domain_throttle.record_result(url, result.status)
 
@@ -729,10 +707,14 @@ class Crawler:
                     self._pages_fetched += 1
                     return
 
+                # Hash the page body once; reuse for the conditional-GET check,
+                # the url_cache update, and dedup below.
+                page_hash = hashlib.md5(result.html.encode()).hexdigest()
+
                 # Content hash check for 200 responses with no ETag support (E4)
                 if self._conditional_get and result.ok:
-                    new_hash = hashlib.md5(result.html.encode()).hexdigest()
-                    cached = await self._get_url_cache(url)
+                    new_hash = page_hash
+                    cached = url_cache_row  # reuse the row read before the fetch
                     if cached and cached.get("content_hash") == new_hash:
                         self._unchanged_pages += 1
                         logger.debug("Content hash unchanged: %s", url)
@@ -751,12 +733,12 @@ class Crawler:
                             url,
                             etag=result.headers.get("etag"),
                             last_modified=result.headers.get("last-modified"),
-                            content_hash=hashlib.md5(result.html.encode()).hexdigest(),
+                            content_hash=page_hash,
                         )
 
                 # Content deduplication (opt-in)
                 if self._deduplicate_content:
-                    content_hash = hashlib.md5(result.html.encode()).hexdigest()
+                    content_hash = page_hash
                     if await queue.is_content_seen(content_hash):
                         logger.debug("Duplicate content at %s — skipping", url)
                         await queue.mark_visited(url)
@@ -785,40 +767,44 @@ class Crawler:
                     logger.warning("Spider has no callback '%s'", callback)
                     return
 
+                # Collect a page's items and discovered links, then flush each in
+                # one batched write instead of a connection + commit per row. The
+                # per-link is_visited pre-check is dropped: INSERT OR IGNORE plus
+                # the dispatcher's post-pop visited check already dedupe.
+                page_items: list[Item] = []
+                child_requests: list[tuple[str, str, int, dict[str, Any]]] = []
+
                 gen = handler(response)
                 if inspect.isasyncgen(gen):
                     async for obj in gen:
                         if isinstance(obj, Item):
                             obj = self._validate_item(obj, spider)
-                            await item_queue.put(obj)
-                            await self._persist_item(obj)
+                            await item_queue.put(obj)  # stream immediately
+                            page_items.append(obj)
                         elif isinstance(obj, Request):
                             if not _url_passes_domain_scope(obj.url, spider):
                                 logger.debug("Skipping out-of-scope URL from parse(): %s", obj.url)
                                 continue
-                            if _follow_links and not await queue.is_visited(obj.url):
-                                child_meta = {
-                                    **(obj.meta or {}),
-                                    "depth": current_depth + 1,
-                                    "referer": url,
-                                }
-                                await queue.push(
+                            if _follow_links:
+                                child_requests.append((
                                     obj.url,
-                                    callback=obj.callback or "parse",
-                                    priority=obj.priority,
-                                    meta=child_meta,
-                                )
+                                    obj.callback or "parse",
+                                    obj.priority,
+                                    {**(obj.meta or {}), "depth": current_depth + 1, "referer": url},
+                                ))
 
                 # Also apply @rule link following
                 if _follow_links:
                     for req in spider.follow_links(response):
-                        if not await queue.is_visited(req.url):
-                            child_meta = {
-                                **(req.meta or {}),
-                                "depth": current_depth + 1,
-                                "referer": url,
-                            }
-                            await queue.push(req.url, callback=req.callback or "parse", meta=child_meta)
+                        child_requests.append((
+                            req.url,
+                            req.callback or "parse",
+                            req.priority,
+                            {**(req.meta or {}), "depth": current_depth + 1, "referer": url},
+                        ))
+
+                await self._persist_items(page_items)
+                await queue.push_batch(child_requests)
 
             except asyncio.CancelledError:
                 raise
@@ -826,14 +812,12 @@ class Crawler:
                 logger.warning("Worker timed out after %.0fs for %s", self._worker_timeout, url)
                 await queue.increment_retry(url, self._max_url_retries)
                 await self._circuit_breaker.record_failure(url)
-                self._outcome_window.append(True)
                 if self._proxy_manager and proxy:
                     self._proxy_manager.report_failure(proxy)
             except Exception as exc:
                 logger.exception("Error fetching %s: %s", url, exc)
                 await queue.increment_retry(url, self._max_url_retries)
                 await self._circuit_breaker.record_failure(url)
-                self._outcome_window.append(True)
                 if self._proxy_manager and proxy:
                     self._proxy_manager.report_failure(proxy)
 
@@ -945,7 +929,12 @@ class Crawler:
         fetcher._session_cookies.update(cookies)
 
     async def _do_fetch(
-        self, url: str, *, proxy: str | None, meta: dict[str, Any]
+        self,
+        url: str,
+        *,
+        proxy: str | None,
+        meta: dict[str, Any],
+        cached: dict[str, Any] | None = None,
     ) -> FetchResult:
         use_browser = meta.get("use_browser", False)
 
@@ -976,13 +965,11 @@ class Crawler:
         extra_headers: dict[str, str] = (
             dict(self._auth_headers) if self._auth_headers and in_scope else {}
         )
-        if self._conditional_get:
-            cached = await self._get_url_cache(url)
-            if cached:
-                if cached.get("etag"):
-                    extra_headers["If-None-Match"] = cached["etag"]
-                if cached.get("last_modified"):
-                    extra_headers["If-Modified-Since"] = cached["last_modified"]
+        if self._conditional_get and cached:
+            if cached.get("etag"):
+                extra_headers["If-None-Match"] = cached["etag"]
+            if cached.get("last_modified"):
+                extra_headers["If-Modified-Since"] = cached["last_modified"]
 
         cookies_for_request = self._cookies if in_scope else {}
         if self._fetcher is not None:
@@ -1109,11 +1096,48 @@ class Crawler:
             )
         return [dict(r) for r in rows]
 
+    @staticmethod
+    async def get_crawl(crawl_id: str, db_path: Path | None = None) -> dict[str, Any] | None:
+        """Fetch a single crawl's row by id (no full-table scan)."""
+        async with crawl_db(db_path or DATA_DIR / "crawls.db") as db:
+            rows = await db.execute_fetchall(
+                """
+                SELECT crawl_id, spider_name, state, items_count, created_at, updated_at
+                FROM crawls WHERE crawl_id = ?
+                """,
+                (crawl_id,),
+            )
+        return dict(rows[0]) if rows else None
+
+    @staticmethod
+    async def count_items(crawl_id: str, db_path: Path | None = None) -> int:
+        """Return the number of persisted items for a crawl without loading them."""
+        async with crawl_db(db_path or DATA_DIR / "crawls.db") as db:
+            rows = await db.execute_fetchall(
+                "SELECT COUNT(*) AS n FROM items WHERE crawl_id = ?", (crawl_id,)
+            )
+        return int(rows[0]["n"]) if rows else 0
+
     async def _persist_item(self, item: Item) -> None:
         async with crawl_db(self._db_path) as db:
             await db.execute(
                 "INSERT INTO items (crawl_id, source_url, spider_name, data) VALUES (?,?,?,?)",
                 (self._crawl_id, item.source_url, item.spider_name, json.dumps(item.data)),
+            )
+            await db.commit()
+
+    async def _persist_items(self, items: list[Item]) -> None:
+        """Persist a page's worth of items in one executemany + commit instead of
+        a connection open + fsync per item."""
+        if not items:
+            return
+        async with crawl_db(self._db_path) as db:
+            await db.executemany(
+                "INSERT INTO items (crawl_id, source_url, spider_name, data) VALUES (?,?,?,?)",
+                [
+                    (self._crawl_id, it.source_url, it.spider_name, json.dumps(it.data))
+                    for it in items
+                ],
             )
             await db.commit()
 
@@ -1257,12 +1281,13 @@ class Crawler:
 
         if path:
             target = Path(path)
-            target.write_text(out, encoding="utf-8")
+            # Write off the event loop so a large export doesn't block it.
+            await asyncio.to_thread(target.write_text, out, encoding="utf-8")
             # Restrict the export file to the owner; the default umask of 022
             # would leave it world-readable, which is a leak on shared hosts.
             try:
                 import os
-                os.chmod(target, 0o600)
+                await asyncio.to_thread(os.chmod, target, 0o600)
             except OSError:
                 pass
             return path

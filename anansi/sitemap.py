@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timezone
-from typing import AsyncIterator, NamedTuple
+from typing import Any, AsyncIterator, NamedTuple
 from urllib.parse import urlparse
 
 from anansi.security import (
@@ -105,29 +105,32 @@ async def iter_sitemap_entries(base_url: str) -> AsyncIterator[SitemapEntry]:
     from anansi.fetchers.http import HTTPFetcher
 
     sitemap_url = f"{base_url.rstrip('/')}/sitemap.xml"
-    xml: str | None = None
-
-    try:
-        async with HTTPFetcher() as f:
-            result = await f.fetch(sitemap_url, timeout=15.0)
-        if result.status == 200:
-            xml = _maybe_decompress(result.html, sitemap_url, result.headers.get("content-type", ""))
-        else:
-            # Try the gzip variant as a fallback
-            gz_url = f"{base_url.rstrip('/')}/sitemap.xml.gz"
-            async with HTTPFetcher() as f:
-                result = await f.fetch(gz_url, timeout=15.0)
-            if result.status == 200:
-                xml = _maybe_decompress(result.html, gz_url, result.headers.get("content-type", ""))
-    except Exception:
-        return
-
-    if not xml:
-        return
-
     parent_host = urlparse(base_url).hostname or ""
-    async for entry in _parse_sitemap(xml, parent_host=parent_host, depth=0, fetched=[0]):
-        yield entry
+
+    # One fetcher for the whole traversal (root + gzip fallback + every child
+    # sitemap) so connections/TLS are reused instead of a fresh client per fetch.
+    async with HTTPFetcher() as f:
+        xml: str | None = None
+        try:
+            result = await f.fetch(sitemap_url, timeout=15.0)
+            if result.status == 200:
+                xml = _maybe_decompress(result.html, sitemap_url, result.headers.get("content-type", ""))
+            else:
+                # Try the gzip variant as a fallback
+                gz_url = f"{base_url.rstrip('/')}/sitemap.xml.gz"
+                result = await f.fetch(gz_url, timeout=15.0)
+                if result.status == 200:
+                    xml = _maybe_decompress(result.html, gz_url, result.headers.get("content-type", ""))
+        except Exception:
+            return
+
+        if not xml:
+            return
+
+        async for entry in _parse_sitemap(
+            xml, parent_host=parent_host, depth=0, fetched=[0], fetcher=f
+        ):
+            yield entry
 
 
 async def _parse_sitemap(
@@ -136,16 +139,15 @@ async def _parse_sitemap(
     parent_host: str,
     depth: int,
     fetched: list[int],
+    fetcher: Any,
 ) -> AsyncIterator[SitemapEntry]:
     """Parse one sitemap or sitemap-index XML string, yielding SitemapEntry objects.
 
     *parent_host* and *depth* / *fetched* bound the recursion against hostile
     sitemaps that try to fan out into private networks or unbounded child trees.
     ``fetched`` is a single-element list used as a mutable counter shared across
-    recursive calls.
+    recursive calls. *fetcher* is the shared HTTPFetcher reused for child fetches.
     """
-    from anansi.fetchers.http import HTTPFetcher
-
     if "<sitemapindex" in xml:
         # Index file — each <loc> points to a child sitemap; <lastmod> here
         # refers to the child sitemap file, not the page, so we ignore it.
@@ -174,8 +176,7 @@ async def _parse_sitemap(
                 )
                 continue
             try:
-                async with HTTPFetcher() as f:
-                    result = await f.fetch(child_url, timeout=15.0)
+                result = await fetcher.fetch(child_url, timeout=15.0)
                 if result.status == 200:
                     child_xml = _maybe_decompress(
                         result.html, child_url, result.headers.get("content-type", "")
@@ -185,36 +186,40 @@ async def _parse_sitemap(
                         parent_host=parent_host,
                         depth=depth + 1,
                         fetched=fetched,
+                        fetcher=fetcher,
                     ):
                         yield entry
             except Exception:
                 continue
     else:
-        # Extract all <url> blocks and parse metadata from each
-        url_blocks = re.findall(r"<url>(.*?)</url>", xml, re.DOTALL)
-        if url_blocks:
-            for block in url_blocks:
-                loc_match = re.search(r"<loc>\s*(.*?)\s*</loc>", block)
-                if not loc_match:
-                    continue
-                url = loc_match.group(1).strip()
+        # Stream each <url> block instead of materialising every block of a
+        # (up to 50 MB) sitemap as a list before iterating.
+        found_any = False
+        for m in re.finditer(r"<url>(.*?)</url>", xml, re.DOTALL):
+            found_any = True
+            block = m.group(1)
+            loc_match = re.search(r"<loc>\s*(.*?)\s*</loc>", block)
+            if not loc_match:
+                continue
+            url = loc_match.group(1).strip()
 
-                lastmod_match = re.search(r"<lastmod>\s*(.*?)\s*</lastmod>", block)
-                lastmod = _parse_lastmod(lastmod_match.group(1)) if lastmod_match else None
+            lastmod_match = re.search(r"<lastmod>\s*(.*?)\s*</lastmod>", block)
+            lastmod = _parse_lastmod(lastmod_match.group(1)) if lastmod_match else None
 
-                changefreq_match = re.search(r"<changefreq>\s*(.*?)\s*</changefreq>", block)
-                changefreq = changefreq_match.group(1).strip() if changefreq_match else None
+            changefreq_match = re.search(r"<changefreq>\s*(.*?)\s*</changefreq>", block)
+            changefreq = changefreq_match.group(1).strip() if changefreq_match else None
 
-                priority_match = re.search(r"<priority>\s*(.*?)\s*</priority>", block)
-                priority: float | None = None
-                if priority_match:
-                    try:
-                        priority = float(priority_match.group(1))
-                    except ValueError:
-                        pass
+            priority_match = re.search(r"<priority>\s*(.*?)\s*</priority>", block)
+            priority: float | None = None
+            if priority_match:
+                try:
+                    priority = float(priority_match.group(1))
+                except ValueError:
+                    pass
 
-                yield SitemapEntry(url=url, lastmod=lastmod, changefreq=changefreq, priority=priority)
-        else:
+            yield SitemapEntry(url=url, lastmod=lastmod, changefreq=changefreq, priority=priority)
+
+        if not found_any:
             # Fallback: sitemap without <url> wrappers — extract bare <loc> tags
-            for url in re.findall(r"<loc>\s*(.*?)\s*</loc>", xml):
-                yield SitemapEntry(url=url.strip(), lastmod=None)
+            for m in re.finditer(r"<loc>\s*(.*?)\s*</loc>", xml):
+                yield SitemapEntry(url=m.group(1).strip(), lastmod=None)

@@ -33,11 +33,21 @@ _SPA_MARKERS: tuple[str, ...] = (
     "window.__PRELOADED_STATE__",
 )
 
+# Lowercased once at import so the hot-path marker scan doesn't re-lower per call.
+_SPA_MARKERS_LOWER: tuple[str, ...] = tuple(m.lower() for m in _SPA_MARKERS)
+
 # <noscript> containing a meta-refresh redirect signals a JS-gated page.
 _NOSCRIPT_REDIRECT_RE = re.compile(
     r"<noscript[^>]*>.*?http-equiv=[\"']refresh[\"'].*?</noscript>",
     re.IGNORECASE | re.DOTALL,
 )
+
+# Precompiled tag-strip patterns for the text-ratio heuristics — ``needs_browser``
+# runs on every HTTP response, so compile these once instead of per call.
+_SCRIPT_RE = re.compile(r"<script[^>]*>.*?</script>", re.DOTALL | re.IGNORECASE)
+_STYLE_RE = re.compile(r"<style[^>]*>.*?</style>", re.DOTALL | re.IGNORECASE)
+_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"\s+")
 
 # Patterns that indicate the page is intentionally thin (error / login pages)
 # and should NOT trigger an auto-upgrade.
@@ -113,8 +123,8 @@ def needs_browser(html: str) -> bool:
     sample_lower = sample.lower()
 
     # Heuristic 1: SPA markers
-    for marker in _SPA_MARKERS:
-        if marker.lower() in sample_lower:
+    for marker in _SPA_MARKERS_LOWER:
+        if marker in sample_lower:
             logger.debug("SPA marker found: %r — flagging as JS shell", marker)
             return True
 
@@ -126,10 +136,10 @@ def needs_browser(html: str) -> bool:
     # Heuristics 3 & 4 need visible text — strip tags without BeautifulSoup
     # to keep the hot path free of heavy imports.
     try:
-        text = re.sub(r"<script[^>]*>.*?</script>", "", sample, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r"<[^>]+>", "", text)
-        text = re.sub(r"\s+", " ", text).strip()
+        text = _SCRIPT_RE.sub("", sample)
+        text = _STYLE_RE.sub("", text)
+        text = _TAG_RE.sub("", text)
+        text = _WS_RE.sub(" ", text).strip()
     except Exception:
         return False
 

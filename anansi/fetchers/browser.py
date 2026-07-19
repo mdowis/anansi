@@ -17,6 +17,7 @@ import logging
 import math
 import random
 import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
@@ -366,11 +367,18 @@ class BrowserFetcher(BaseFetcher):
         # persona). A protected domain that earned a cf_clearance / _abck in
         # one context keeps reusing that context (and its cookies) instead of
         # starting cold on every checkout. The anonymous _context_pool above is
-        # still used when no session_key is supplied.
-        self._session_pools: dict[str, asyncio.Queue] = {}
+        # still used when no session_key is supplied. LRU-bounded so a crawl over
+        # many domains does not leave an unbounded number of idle browser
+        # contexts open (each holds a full renderer context's memory).
+        self._session_pools: "OrderedDict[str, asyncio.Queue]" = OrderedDict()
+        self._max_session_pools = 32
         self._lock = asyncio.Lock()
 
     async def _ensure_browser(self) -> None:
+        # Lock-free fast path: the browser is launched once and not torn down
+        # mid-life, so the common "already up" case skips acquiring the lock.
+        if self._browser is not None:
+            return
         async with self._lock:
             if self._browser is not None:
                 return
@@ -421,16 +429,34 @@ class BrowserFetcher(BaseFetcher):
             js = js.replace(token, value)
         return js
 
-    def _pool_for(self, session_key: str | None) -> "asyncio.Queue | None":
+    async def _acquire_pool(self, session_key: str | None) -> "asyncio.Queue | None":
         """Return the context pool for *session_key* (the anonymous pool when
-        None), creating a keyed pool on first use."""
+        None), creating a keyed pool on first use and LRU-evicting the oldest
+        keyed pool (closing its idle contexts) when the cap is exceeded."""
         if session_key is None:
             return self._context_pool
         pool = self._session_pools.get(session_key)
-        if pool is None:
-            pool = asyncio.Queue(maxsize=self._max_contexts)
-            self._session_pools[session_key] = pool
+        if pool is not None:
+            self._session_pools.move_to_end(session_key)  # most-recently-used
+            return pool
+        while len(self._session_pools) >= self._max_session_pools:
+            _old_key, old_pool = self._session_pools.popitem(last=False)
+            await self._drain_pool(old_pool)
+        pool = asyncio.Queue(maxsize=self._max_contexts)
+        self._session_pools[session_key] = pool
         return pool
+
+    async def _drain_pool(self, pool: "asyncio.Queue") -> None:
+        """Close and discard every idle context left in *pool*."""
+        while not pool.empty():
+            try:
+                ctx = pool.get_nowait()[0]
+            except asyncio.QueueEmpty:
+                break
+            try:
+                await ctx.close()
+            except Exception:
+                pass
 
     @asynccontextmanager
     async def _get_context(
@@ -449,7 +475,7 @@ class BrowserFetcher(BaseFetcher):
         # reused even behind a proxy. The anonymous pool keeps its old rule:
         # reuse only when there is no proxy override.
         sticky = session_key is not None
-        pool = self._pool_for(session_key)
+        pool = await self._acquire_pool(session_key)
 
         async with self._context_semaphore:
             # Try to reuse an idle context unless a fresh fingerprint was
@@ -522,14 +548,12 @@ class BrowserFetcher(BaseFetcher):
             # session is intentionally NOT cleared — that earned state (e.g. a
             # solved cf_clearance) is the whole point of keeping it.
             if not sticky:
-                try:
-                    await ctx.clear_cookies()
-                except Exception:
-                    pass
-                try:
-                    await ctx.clear_permissions()
-                except Exception:
-                    pass
+                # Two independent round-trips to the browser — clear concurrently.
+                await asyncio.gather(
+                    ctx.clear_cookies(),
+                    ctx.clear_permissions(),
+                    return_exceptions=True,
+                )
 
             poisoned = False
             try:
@@ -952,11 +976,18 @@ class BrowserFetcher(BaseFetcher):
                             for c in await ctx.cookies()
                         }
 
-                        # Read captured response bodies after all navigation is done.
+                        # Read captured response bodies after navigation is done.
+                        # The reads are independent round-trips, so fetch them
+                        # concurrently (bounded by the 50-entry capture cap).
                         captured_requests: list[dict[str, Any]] = []
-                        for captured_resp in _captured_resp_objects:
+                        _bodies = await asyncio.gather(
+                            *(cr.body() for cr in _captured_resp_objects),
+                            return_exceptions=True,
+                        )
+                        for captured_resp, body_bytes in zip(_captured_resp_objects, _bodies):
+                            if isinstance(body_bytes, BaseException):
+                                continue
                             try:
-                                body_bytes = await captured_resp.body()
                                 if len(body_bytes) > 200 * 1024:
                                     continue
                                 captured_requests.append({

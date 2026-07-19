@@ -142,26 +142,25 @@ class ProxyManager:
 
     def _next_legacy(self) -> str:
         """History-free selection by the configured rotation strategy."""
-        healthy = [e for e in self._entries.values() if e.healthy]
-        if not healthy:
-            raise NoProxiesAvailable("All proxies are quarantined or exhausted")
-
-        if self._strategy == ProxyRotationStrategy.RANDOM:
-            entry = random.choice(healthy)
-        elif self._strategy == ProxyRotationStrategy.LEAST_USED:
-            entry = min(healthy, key=lambda e: e.use_count)
-        else:  # ROUND_ROBIN
-            # Pop from deque, skip quarantined, push back
+        if self._strategy == ProxyRotationStrategy.ROUND_ROBIN:
+            # Pop from deque, skip quarantined, push back. This path walks the
+            # queue directly, so it never needs the O(n) ``healthy`` snapshot.
             for _ in range(len(self._queue)):
                 url = self._queue.popleft()
                 self._queue.append(url)
                 e = self._entries.get(url)
                 if e and e.healthy:
-                    entry = e
-                    break
-            else:
-                raise NoProxiesAvailable("All proxies are quarantined")
+                    e.use_count += 1
+                    return e.url
+            raise NoProxiesAvailable("All proxies are quarantined")
 
+        healthy = [e for e in self._entries.values() if e.healthy]
+        if not healthy:
+            raise NoProxiesAvailable("All proxies are quarantined or exhausted")
+        if self._strategy == ProxyRotationStrategy.RANDOM:
+            entry = random.choice(healthy)
+        else:  # LEAST_USED
+            entry = min(healthy, key=lambda e: e.use_count)
         entry.use_count += 1
         return entry.url
 

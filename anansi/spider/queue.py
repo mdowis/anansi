@@ -2,8 +2,9 @@
 SQLite-backed persistent URL queue for pause/resume support.
 
 Uses INSERT OR IGNORE so duplicate URLs are silently dropped. Pops the
-highest-priority, lowest-id pending URL atomically via a single UPDATE…RETURNING
-statement (SQLite ≥ 3.35 / Python ≥ 3.11 ships with this version).
+highest-priority, lowest-id pending URL that has not already been visited,
+atomically via a single UPDATE…RETURNING statement (SQLite ≥ 3.35 / Python ≥ 3.11
+ships with this version).
 """
 
 from __future__ import annotations
@@ -67,27 +68,48 @@ class SQLiteQueue:
             return cur.rowcount > 0
 
     async def push_many(self, urls: list[str], **kwargs: Any) -> int:
-        """Batch-insert URLs. Returns count of newly inserted rows."""
-        inserted = 0
+        """Batch-insert URLs sharing the same priority/callback/meta.
+
+        Returns the number of newly inserted rows (best effort).
+        """
+        if not urls:
+            return 0
+        priority = kwargs.get("priority", 0)
+        callback = kwargs.get("callback", "parse")
+        meta_json = json.dumps(kwargs.get("meta") or {})
+        params = [
+            (self.crawl_id, self._norm(url), priority, callback, meta_json)
+            for url in urls
+        ]
+        return await self._insert_many(params)
+
+    async def push_batch(
+        self, requests: list[tuple[str, str, int, dict[str, Any] | None]]
+    ) -> int:
+        """Batch-insert ``(url, callback, priority, meta)`` rows in one
+        transaction — one ``executemany`` + one commit instead of a
+        connection/round-trip per URL. Returns the number of newly inserted rows.
+        """
+        if not requests:
+            return 0
+        params = [
+            (self.crawl_id, self._norm(url), priority, callback, json.dumps(meta or {}))
+            for (url, callback, priority, meta) in requests
+        ]
+        return await self._insert_many(params)
+
+    async def _insert_many(self, params: list[tuple[Any, ...]]) -> int:
         async with crawl_db(self._db_path) as db:
-            for url in urls:
-                cur = await db.execute(
-                    """
-                    INSERT OR IGNORE INTO url_queue
-                        (crawl_id, url, priority, callback, meta)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        self.crawl_id,
-                        self._norm(url),
-                        kwargs.get("priority", 0),
-                        kwargs.get("callback", "parse"),
-                        json.dumps(kwargs.get("meta") or {}),
-                    ),
-                )
-                inserted += cur.rowcount
+            cur = await db.executemany(
+                """
+                INSERT OR IGNORE INTO url_queue
+                    (crawl_id, url, priority, callback, meta)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                params,
+            )
             await db.commit()
-        return inserted
+            return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
     # ── Dequeue ───────────────────────────────────────────────────────────────
 
@@ -95,28 +117,34 @@ class SQLiteQueue:
         """
         Atomically claim and return (url, callback, meta) for the next pending URL.
         Returns None when the queue is empty.
+
+        A single ``UPDATE ... RETURNING`` claims the highest-priority pending row
+        that has not already been visited — one statement instead of a SELECT then
+        a separate UPDATE, so two concurrent pops can never claim the same row.
         """
         async with crawl_db(self._db_path) as db:
-            # Find the best candidate
-            row = await db.execute_fetchall(
+            rows = await db.execute_fetchall(
                 """
-                SELECT id, url, callback, meta
-                FROM url_queue
-                WHERE crawl_id = ? AND status = 'pending'
-                ORDER BY priority DESC, id ASC
-                LIMIT 1
+                UPDATE url_queue SET status = 'processing'
+                WHERE id = (
+                    SELECT q.id FROM url_queue q
+                    WHERE q.crawl_id = ? AND q.status = 'pending'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM visited_urls v
+                          WHERE v.crawl_id = q.crawl_id AND v.url = q.url
+                      )
+                    ORDER BY q.priority DESC, q.id ASC
+                    LIMIT 1
+                )
+                RETURNING url, callback, meta
                 """,
                 (self.crawl_id,),
             )
-            if not row:
-                return None
-            rid, url, callback, meta_json = row[0]["id"], row[0]["url"], row[0]["callback"], row[0]["meta"]
-            await db.execute(
-                "UPDATE url_queue SET status = 'processing' WHERE id = ?",
-                (rid,),
-            )
             await db.commit()
-        return url, callback, json.loads(meta_json or "{}")
+            if not rows:
+                return None
+        row = rows[0]
+        return row["url"], row["callback"], json.loads(row["meta"] or "{}")
 
     async def mark_done(self, url: str) -> None:
         async with crawl_db(self._db_path) as db:

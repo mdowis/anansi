@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import Any, AsyncIterator, Callable
 from urllib.parse import urljoin, urlparse
 
@@ -39,15 +40,24 @@ class Response:
     def urljoin(self, href: str) -> str:
         return urljoin(self.url, href)
 
-    def css(self, selector: str) -> list[Any]:
+    @cached_property
+    def _soup(self) -> Any:
+        """Parsed BeautifulSoup tree, built once and shared by every ``css()``
+        call (and by the spider's ``follow_links``) instead of re-parsing per call."""
         from bs4 import BeautifulSoup
-        soup = BeautifulSoup(self.html, "lxml")
-        return soup.select(selector)
+        return BeautifulSoup(self.html, "lxml")
+
+    @cached_property
+    def _dom(self) -> Any:
+        """Parsed lxml tree, built once and shared by every ``xpath()`` call."""
+        from lxml import etree
+        return etree.fromstring(self.html.encode(), etree.HTMLParser())
+
+    def css(self, selector: str) -> list[Any]:
+        return self._soup.select(selector)
 
     def xpath(self, query: str) -> list[Any]:
-        from lxml import etree
-        tree = etree.fromstring(self.html.encode(), etree.HTMLParser())
-        return tree.xpath(query)
+        return self._dom.xpath(query)
 
 
 @dataclass
@@ -101,8 +111,8 @@ class Spider(metaclass=SpiderMeta):
 
     def follow_links(self, response: Response) -> list[Request]:
         """Apply registered rules to extract followable links."""
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(response.html, "lxml")
+        # Reuse the response's cached parse tree instead of building another.
+        soup = response._soup
         requests: list[Request] = []
         for anchor in soup.find_all("a", href=True):
             href = response.urljoin(anchor["href"])

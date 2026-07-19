@@ -10,8 +10,25 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from bs4 import BeautifulSoup, Tag
+
+# One lxml tree per BeautifulSoup, parsed on first need and cached weakly so the
+# XPath selector attempts and the healing fallback don't each re-serialize
+# (str(soup)) and re-parse the same document. Dropped automatically when the
+# soup is garbage-collected.
+_LXML_TREE_CACHE: "WeakKeyDictionary[Any, Any]" = WeakKeyDictionary()
+
+
+def lxml_tree(soup: BeautifulSoup) -> Any:
+    """Return a cached lxml tree for *soup* (built once per soup)."""
+    tree = _LXML_TREE_CACHE.get(soup)
+    if tree is None:
+        from lxml import etree
+        tree = etree.fromstring(str(soup).encode(), etree.HTMLParser())
+        _LXML_TREE_CACHE[soup] = tree
+    return tree
 
 logger = logging.getLogger(__name__)
 
@@ -78,67 +95,75 @@ def extract_microdata(soup: BeautifulSoup) -> list[dict[str, Any]]:
     multiple times under one scope, values are collected into a list.
     """
 
+    def _prop_value(el: Tag) -> Any:
+        if el.has_attr("itemscope"):
+            return _collect_item(el)
+        if el.name in ("a", "link") and el.get("href"):
+            return el["href"]
+        if el.name in ("img", "audio", "video", "source") and el.get("src"):
+            return el["src"]
+        if el.name == "meta" and el.get("content") is not None:
+            return el["content"]
+        if el.name == "time" and el.get("datetime"):
+            return el["datetime"]
+        return el.get_text(separator=" ", strip=True)
+
+    def _add(item: dict[str, Any], name: str, value: Any) -> None:
+        if name in item:
+            existing = item[name]
+            if isinstance(existing, list):
+                existing.append(value)
+            else:
+                item[name] = [existing, value]
+        else:
+            item[name] = value
+
     def _collect_item(root: Tag) -> dict[str, Any]:
         item: dict[str, Any] = {}
         item_type = root.get("itemtype", "")
         if item_type:
             item["@type"] = item_type
 
-        for el in root.find_all(itemprop=True):
-            # Skip elements nested inside a child itemscope
-            parent = el.parent
-            inside_nested = False
-            while parent and parent is not root:
-                if isinstance(parent, Tag) and parent.has_attr("itemscope"):
-                    inside_nested = True
-                    break
-                parent = parent.parent
-            if inside_nested:
-                continue
-
-            prop_name = el.get("itemprop", "").strip()
-            if not prop_name:
-                continue
-
-            if el.has_attr("itemscope"):
-                value: Any = _collect_item(el)
-            elif el.name in ("a", "link") and el.get("href"):
-                value = el["href"]
-            elif el.name in ("img", "audio", "video", "source") and el.get("src"):
-                value = el["src"]
-            elif el.name == "meta" and el.get("content") is not None:
-                value = el["content"]
-            elif el.name == "time" and el.get("datetime"):
-                value = el["datetime"]
-            else:
-                value = el.get_text(separator=" ", strip=True)
-
-            if prop_name in item:
-                existing = item[prop_name]
-                if isinstance(existing, list):
-                    existing.append(value)
+        # Single descent over the subtree instead of ``find_all(itemprop=True)``
+        # plus an O(depth) ancestor walk per hit: recurse into a nested itemscope
+        # only through its own sub-item (its props don't belong to this scope).
+        def _walk(node: Tag) -> None:
+            for child in node.children:
+                if not isinstance(child, Tag):
+                    continue
+                has_prop = child.has_attr("itemprop")
+                has_scope = child.has_attr("itemscope")
+                if has_prop:
+                    prop_name = child.get("itemprop", "").strip()
+                    if prop_name:
+                        _add(item, prop_name, _prop_value(child))
+                    # A nested scope's inner props belong to the sub-item, so only
+                    # keep descending when this itemprop is not itself a scope.
+                    if not has_scope:
+                        _walk(child)
+                elif has_scope:
+                    # Nested scope with no itemprop is a separate item; skip it.
+                    continue
                 else:
-                    item[prop_name] = [existing, value]
-            else:
-                item[prop_name] = value
+                    _walk(child)
 
+        _walk(root)
         return item
 
     results: list[dict[str, Any]] = []
-    for el in soup.find_all(itemscope=True):
-        if not isinstance(el, Tag):
-            continue
-        # Only process top-level itemscope elements
-        parent = el.parent
-        inside_another = False
-        while parent and getattr(parent, "name", None) not in ("html", "[document]", None):
-            if isinstance(parent, Tag) and parent.has_attr("itemscope"):
-                inside_another = True
-                break
-            parent = parent.parent
-        if not inside_another:
-            results.append(_collect_item(el))
 
+    # Collect only top-level itemscopes (those with no itemscope ancestor) by
+    # descending from the root and stopping at the first scope on each branch.
+    def _find_top(node: Tag) -> None:
+        for child in node.children:
+            if not isinstance(child, Tag):
+                continue
+            if child.has_attr("itemscope"):
+                results.append(_collect_item(child))
+            else:
+                _find_top(child)
+
+    _find_top(soup)
     return results
 
 
@@ -152,8 +177,16 @@ def extract_spa_state(soup: BeautifulSoup) -> dict[str, Any]:
     (__INITIAL_STATE__, __PRELOADED_STATE__, __REDUX_STATE__) patterns.
     Returns only keys that were found; malformed JSON is silently skipped.
     """
-    raw_html = str(soup)
-    if not any(m in raw_html for m in _SPA_MARKERS):
+    # Markers live either in a script's id (``<script id="__NEXT_DATA__">``) or in
+    # its text (``window.__NUXT__=``). Gate on the scripts alone instead of
+    # serialising the whole document with str(soup).
+    scripts = soup.find_all("script")
+    script_texts = [s.get_text() for s in scripts]
+    if not any(
+        m in ((s.get("id") or "") + t)
+        for s, t in zip(scripts, script_texts)
+        for m in _SPA_MARKERS
+    ):
         return {}
 
     result: dict[str, Any] = {}
@@ -173,8 +206,7 @@ def extract_spa_state(soup: BeautifulSoup) -> dict[str, Any]:
         "__PRELOADED_STATE__": "preloaded_state",
         "__REDUX_STATE__": "redux_state",
     }
-    for script in soup.find_all("script"):
-        text = script.get_text()
+    for text in script_texts:
         if not text:
             continue
         for marker, key in _var_map.items():

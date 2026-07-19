@@ -103,8 +103,8 @@ class Spider(metaclass=SpiderMeta):
 
     def follow_links(self, response: Response) -> list[Request]:
         """Apply registered @rule patterns to extract followable URLs."""
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(response.html, "lxml")
+        # Reuse the response's cached parse tree instead of building another.
+        soup = response._soup
         seen: set[str] = set()
         requests: list[Request] = []
 

@@ -31,6 +31,7 @@ from anansi.parser.strategies import (
     strategy_xpath_fallback,
 )
 from anansi.parser.structured import extract_all as _extract_structured
+from anansi.parser.structured import extract_jsonld, extract_opengraph, lxml_tree
 
 # JSON-LD property names that map directly to common scraping field names
 _JSONLD_FIELDS = frozenset({
@@ -137,20 +138,63 @@ class AdaptiveParser:
         Returns a dict mapping each field name to its extracted value (or None).
         """
         soup = BeautifulSoup(html, "lxml")
-        url_pattern = _url_to_pattern(url)
 
-        # Structured data pre-pass — run once, not per field
+        # Structured data pre-pass — run once, not per field. Only JSON-LD and
+        # Open Graph feed selector fields; skip the microdata / SPA-state work
+        # (and its str(soup)) that extract_all would also compute here.
         structured_values: dict[str, Any] = {}
         if use_structured:
-            sd = _extract_structured(soup)
-            for obj in sd["json_ld"]:
-                for k, v in obj.items():
-                    if not k.startswith("@") and k in _JSONLD_FIELDS and k not in structured_values:
-                        structured_values[k] = v
-            for field_name, og_key in _OG_ALIASES.items():
-                if field_name not in structured_values and og_key in sd["open_graph"]:
-                    structured_values[field_name] = sd["open_graph"][og_key]
+            self._fold_structured(
+                structured_values, extract_jsonld(soup), extract_opengraph(soup)
+            )
+        return await self._extract_fields(soup, selectors, url, structured_values)
 
+    async def extract_with_structured(
+        self,
+        html: str,
+        selectors: dict[str, str | SelectorConfig],
+        url: str = "",
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Parse *html* once and return ``(selector_fields, full_structured)``.
+
+        ``full_structured`` is ``structured.extract_all``'s shape (json_ld,
+        open_graph, microdata, spa_state). Lets callers that want both the
+        selector fields and the complete structured payload avoid a second parse.
+        """
+        soup = BeautifulSoup(html, "lxml")
+        structured = _extract_structured(soup)
+        structured_values: dict[str, Any] = {}
+        self._fold_structured(
+            structured_values, structured["json_ld"], structured["open_graph"]
+        )
+        fields = await self._extract_fields(soup, selectors, url, structured_values)
+        return fields, structured
+
+    def _fold_structured(
+        self,
+        structured_values: dict[str, Any],
+        json_ld: list[dict[str, Any]],
+        open_graph: dict[str, str],
+    ) -> None:
+        """Fold JSON-LD / Open Graph metadata into pre-resolved field values."""
+        for obj in json_ld:
+            for k, v in obj.items():
+                if not k.startswith("@") and k in _JSONLD_FIELDS and k not in structured_values:
+                    structured_values[k] = v
+        for field_name, og_key in _OG_ALIASES.items():
+            if field_name not in structured_values and og_key in open_graph:
+                structured_values[field_name] = open_graph[og_key]
+
+    async def _extract_fields(
+        self,
+        soup: BeautifulSoup,
+        selectors: dict[str, str | SelectorConfig],
+        url: str,
+        structured_values: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run adaptive selector extraction over *soup* for fields not already
+        resolved from structured metadata, and merge the two."""
+        url_pattern = _url_to_pattern(url)
         tasks = {
             f: self._extract_field(soup, f, cfg, url_pattern)
             for f, cfg in selectors.items()
@@ -164,7 +208,6 @@ class AdaptiveParser:
                 css_results[field_name] = None
             else:
                 css_results[field_name] = result
-
         return {f: structured_values.get(f, css_results.get(f)) for f in selectors}
 
     async def extract_structured(self, html: str) -> dict[str, Any]:
@@ -304,9 +347,8 @@ class AdaptiveParser:
             if stype == "css":
                 tags = soup.select(selector)
             elif stype == "xpath":
-                from lxml import etree
-                tree = etree.fromstring(str(soup).encode(), etree.HTMLParser())
-                lxml_els = tree.xpath(selector)
+                # Shared, once-parsed lxml tree (not a per-candidate re-parse).
+                lxml_els = lxml_tree(soup).xpath(selector)
                 # Convert lxml elements back to text
                 from lxml import etree as le
                 if cfg.multiple:
@@ -326,7 +368,7 @@ class AdaptiveParser:
                 return None
 
             if cfg.multiple:
-                return [_extract_from_tag(t, cfg.attribute) for t in tags if _extract_from_tag(t, cfg.attribute)]
+                return [v for t in tags if (v := _extract_from_tag(t, cfg.attribute))]
 
             return _extract_from_tag(tags[0], cfg.attribute)
         except Exception:
