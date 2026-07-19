@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 import respx
@@ -149,3 +151,26 @@ async def test_crawler_does_not_reduce_gap_below_domain_delay(tmp_path) -> None:
 
     # Gap must not be reduced below the configured domain_delay
     assert crawler._domain_throttle._gaps["example.com"] >= 1.0
+
+
+async def test_robots_single_flight_fetches_once(robots_mock) -> None:
+    route = respx.get("https://example.com/robots.txt").mock(
+        return_value=httpx.Response(200, text=_ROBOTS_WITH_DELAY)
+    )
+    cache = RobotsCache(user_agent="*")
+    results = await asyncio.gather(
+        *(cache.allowed("https://example.com/page") for _ in range(10))
+    )
+    assert all(results)
+    assert route.call_count == 1  # 10 concurrent calls → one robots.txt fetch
+
+
+async def test_robots_cache_is_bounded(robots_mock) -> None:
+    respx.get(url__regex=r"https://.*/robots\.txt").mock(
+        return_value=httpx.Response(200, text=_ROBOTS_NO_DELAY)
+    )
+    cache = RobotsCache(user_agent="*")
+    cache._MAX_ENTRIES = 5
+    for i in range(20):
+        await cache.allowed(f"https://host{i}.com/page")
+    assert len(cache._cache) <= 5

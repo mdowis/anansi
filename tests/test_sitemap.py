@@ -174,3 +174,40 @@ async def test_no_sitemap_yields_nothing() -> None:
         respx.get("https://example.com/sitemap.xml.gz").mock(return_value=httpx.Response(404))
         entries = [e async for e in iter_sitemap_entries("https://example.com")]
     assert entries == []
+
+
+_SITEMAP_INDEX = """<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <sitemap><loc>https://example.com/child1.xml</loc></sitemap>
+  <sitemap><loc>https://example.com/child2.xml</loc></sitemap>
+</sitemapindex>
+"""
+
+
+async def test_index_reuses_one_fetcher_across_children(monkeypatch) -> None:
+    import anansi.fetchers.http as http_mod
+
+    real = http_mod.HTTPFetcher
+    count = {"n": 0}
+
+    class _Counting(real):  # type: ignore[misc, valid-type]
+        def __init__(self, *a, **k):
+            count["n"] += 1
+            super().__init__(*a, **k)
+
+    monkeypatch.setattr(http_mod, "HTTPFetcher", _Counting)
+
+    with respx.mock:
+        respx.get("https://example.com/sitemap.xml").mock(
+            return_value=httpx.Response(200, text=_SITEMAP_INDEX)
+        )
+        respx.get("https://example.com/child1.xml").mock(
+            return_value=httpx.Response(200, text=_PLAIN_SITEMAP)
+        )
+        respx.get("https://example.com/child2.xml").mock(
+            return_value=httpx.Response(200, text=_PLAIN_SITEMAP)
+        )
+        entries = [e async for e in iter_sitemap_entries("https://example.com")]
+
+    assert count["n"] == 1  # one fetcher reused for root + both children
+    assert len(entries) == 6  # 3 entries per child sitemap
