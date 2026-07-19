@@ -479,13 +479,16 @@ async def _fetch_one(
         if result.captured_requests:
             meta["captured_requests"] = result.captured_requests
 
+        # HTML→text/markdown/chunk conversion is CPU-bound BeautifulSoup work on
+        # bodies up to _MAX_HTML_BYTES; run it in a thread so it doesn't block the
+        # event loop (and stall concurrent fetch_urls fetches) during each parse.
         if chunk_size:
-            chunks = _get_chunks(result.html, format, chunk_size)
+            chunks = await asyncio.to_thread(_get_chunks, result.html, format, chunk_size)
         else:
             if format == "text":
-                chunks = [_html_to_text(result.html)]
+                chunks = [await asyncio.to_thread(_html_to_text, result.html)]
             elif format == "markdown":
-                chunks = [_html_to_markdown(result.html)]
+                chunks = [await asyncio.to_thread(_html_to_markdown, result.html)]
             else:
                 chunks = [result.html]
 
