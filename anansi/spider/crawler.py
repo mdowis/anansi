@@ -769,40 +769,44 @@ class Crawler:
                     logger.warning("Spider has no callback '%s'", callback)
                     return
 
+                # Collect a page's items and discovered links, then flush each in
+                # one batched write instead of a connection + commit per row. The
+                # per-link is_visited pre-check is dropped: INSERT OR IGNORE plus
+                # the dispatcher's post-pop visited check already dedupe.
+                page_items: list[Item] = []
+                child_requests: list[tuple[str, str, int, dict[str, Any]]] = []
+
                 gen = handler(response)
                 if inspect.isasyncgen(gen):
                     async for obj in gen:
                         if isinstance(obj, Item):
                             obj = self._validate_item(obj, spider)
-                            await item_queue.put(obj)
-                            await self._persist_item(obj)
+                            await item_queue.put(obj)  # stream immediately
+                            page_items.append(obj)
                         elif isinstance(obj, Request):
                             if not _url_passes_domain_scope(obj.url, spider):
                                 logger.debug("Skipping out-of-scope URL from parse(): %s", obj.url)
                                 continue
-                            if _follow_links and not await queue.is_visited(obj.url):
-                                child_meta = {
-                                    **(obj.meta or {}),
-                                    "depth": current_depth + 1,
-                                    "referer": url,
-                                }
-                                await queue.push(
+                            if _follow_links:
+                                child_requests.append((
                                     obj.url,
-                                    callback=obj.callback or "parse",
-                                    priority=obj.priority,
-                                    meta=child_meta,
-                                )
+                                    obj.callback or "parse",
+                                    obj.priority,
+                                    {**(obj.meta or {}), "depth": current_depth + 1, "referer": url},
+                                ))
 
                 # Also apply @rule link following
                 if _follow_links:
                     for req in spider.follow_links(response):
-                        if not await queue.is_visited(req.url):
-                            child_meta = {
-                                **(req.meta or {}),
-                                "depth": current_depth + 1,
-                                "referer": url,
-                            }
-                            await queue.push(req.url, callback=req.callback or "parse", meta=child_meta)
+                        child_requests.append((
+                            req.url,
+                            req.callback or "parse",
+                            req.priority,
+                            {**(req.meta or {}), "depth": current_depth + 1, "referer": url},
+                        ))
+
+                await self._persist_items(page_items)
+                await queue.push_batch(child_requests)
 
             except asyncio.CancelledError:
                 raise
@@ -1099,6 +1103,21 @@ class Crawler:
             await db.execute(
                 "INSERT INTO items (crawl_id, source_url, spider_name, data) VALUES (?,?,?,?)",
                 (self._crawl_id, item.source_url, item.spider_name, json.dumps(item.data)),
+            )
+            await db.commit()
+
+    async def _persist_items(self, items: list[Item]) -> None:
+        """Persist a page's worth of items in one executemany + commit instead of
+        a connection open + fsync per item."""
+        if not items:
+            return
+        async with crawl_db(self._db_path) as db:
+            await db.executemany(
+                "INSERT INTO items (crawl_id, source_url, spider_name, data) VALUES (?,?,?,?)",
+                [
+                    (self._crawl_id, it.source_url, it.spider_name, json.dumps(it.data))
+                    for it in items
+                ],
             )
             await db.commit()
 
