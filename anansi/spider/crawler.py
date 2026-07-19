@@ -1096,6 +1096,28 @@ class Crawler:
             )
         return [dict(r) for r in rows]
 
+    @staticmethod
+    async def get_crawl(crawl_id: str, db_path: Path | None = None) -> dict[str, Any] | None:
+        """Fetch a single crawl's row by id (no full-table scan)."""
+        async with crawl_db(db_path or DATA_DIR / "crawls.db") as db:
+            rows = await db.execute_fetchall(
+                """
+                SELECT crawl_id, spider_name, state, items_count, created_at, updated_at
+                FROM crawls WHERE crawl_id = ?
+                """,
+                (crawl_id,),
+            )
+        return dict(rows[0]) if rows else None
+
+    @staticmethod
+    async def count_items(crawl_id: str, db_path: Path | None = None) -> int:
+        """Return the number of persisted items for a crawl without loading them."""
+        async with crawl_db(db_path or DATA_DIR / "crawls.db") as db:
+            rows = await db.execute_fetchall(
+                "SELECT COUNT(*) AS n FROM items WHERE crawl_id = ?", (crawl_id,)
+            )
+        return int(rows[0]["n"]) if rows else 0
+
     async def _persist_item(self, item: Item) -> None:
         async with crawl_db(self._db_path) as db:
             await db.execute(
@@ -1259,12 +1281,13 @@ class Crawler:
 
         if path:
             target = Path(path)
-            target.write_text(out, encoding="utf-8")
+            # Write off the event loop so a large export doesn't block it.
+            await asyncio.to_thread(target.write_text, out, encoding="utf-8")
             # Restrict the export file to the owner; the default umask of 022
             # would leave it world-readable, which is a leak on shared hosts.
             try:
                 import os
-                os.chmod(target, 0o600)
+                await asyncio.to_thread(os.chmod, target, 0o600)
             except OSError:
                 pass
             return path

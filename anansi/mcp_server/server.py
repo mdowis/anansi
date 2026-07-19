@@ -795,11 +795,11 @@ async def fetch_and_extract(
         return result
 
     from anansi.parser.adaptive import AdaptiveParser
-    from anansi.parser.structured import extract_all as _extract_all_structured
-    from bs4 import BeautifulSoup as _BS
     parser = AdaptiveParser()
-    data = await parser.extract(result["content"], selectors, url=url)
-    structured_data = _extract_all_structured(_BS(result["content"], "lxml"))
+    # Parse the HTML once for both the selector fields and the structured payload.
+    data, structured_data = await parser.extract_with_structured(
+        result["content"], selectors, url=url
+    )
     return {
         "url": result["url"],
         "status": result["status"],
@@ -840,8 +840,8 @@ async def extract(
         return {"error": f"html exceeds {_MAX_HTML_BYTES}-byte cap"}
     from anansi.parser.adaptive import AdaptiveParser
     parser = AdaptiveParser()
-    css_data = await parser.extract(html, selectors, url=url)
-    structured_data = await parser.extract_structured(html)
+    # One parse for both the selector fields and the structured payload.
+    css_data, structured_data = await parser.extract_with_structured(html, selectors, url=url)
     return {**css_data, "structured_data": structured_data}
 
 
@@ -1131,8 +1131,7 @@ async def get_crawl_items(
         status = "finished" if not task.exception() else "error"
 
     if status == "unknown":
-        crawls = await Crawler.list_crawls()
-        info = next((c for c in crawls if c["crawl_id"] == crawl_id), None)
+        info = await Crawler.get_crawl(crawl_id)
         if info is None:
             return {"error": f"Crawl '{crawl_id}' not found"}
         status = info["state"]
@@ -1175,8 +1174,9 @@ async def export_crawl(
     """
     from anansi.spider.crawler import Crawler
 
-    rows = await Crawler.get_items(crawl_id, limit=100_000)
-    if not rows and not (await Crawler.list_crawls()):
+    # Existence check via a single-row lookup instead of loading every item
+    # (and every crawl) just to decide the crawl exists.
+    if await Crawler.get_crawl(crawl_id) is None and await Crawler.count_items(crawl_id) == 0:
         return {"error": f"Crawl '{crawl_id}' not found"}
 
     # Confine the export path to ~/.anansi/exports/. Any '..' segment or
@@ -1190,7 +1190,8 @@ async def export_crawl(
             return {"error": f"export path rejected: {exc}"}
 
     out = await Crawler.export_items(crawl_id, fmt=format, path=confined_path)
-    result: dict[str, Any] = {"crawl_id": crawl_id, "format": format, "rows": len(rows)}
+    rows_count = await Crawler.count_items(crawl_id)
+    result: dict[str, Any] = {"crawl_id": crawl_id, "format": format, "rows": rows_count}
     if confined_path:
         result["path"] = confined_path
     else:
@@ -1216,9 +1217,10 @@ async def crawl_metrics(crawl_id: str) -> dict[str, Any]:
     from anansi.spider.queue import SQLiteQueue
 
     queue = SQLiteQueue(crawl_id)
-    visited = await queue.visited_count()
-    pending = await queue.pending_count()
-    failed = await queue.failed_count()
+    # The three counts are independent — run them concurrently.
+    visited, pending, failed = await asyncio.gather(
+        queue.visited_count(), queue.pending_count(), queue.failed_count()
+    )
 
     crawler = _active_crawlers.get(crawl_id)
     task = _crawl_tasks.get(crawl_id)
@@ -1233,8 +1235,7 @@ async def crawl_metrics(crawl_id: str) -> dict[str, Any]:
     # Pull created_at from persistent store for elapsed calculation
     elapsed: float | None = None
     pages_per_second: float | None = None
-    crawls = await Crawler.list_crawls()
-    info = next((c for c in crawls if c["crawl_id"] == crawl_id), None)
+    info = await Crawler.get_crawl(crawl_id)
     if info:
         status = status if crawler else info["state"]
         try:
