@@ -10,8 +10,25 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from bs4 import BeautifulSoup, Tag
+
+# One lxml tree per BeautifulSoup, parsed on first need and cached weakly so the
+# XPath selector attempts and the healing fallback don't each re-serialize
+# (str(soup)) and re-parse the same document. Dropped automatically when the
+# soup is garbage-collected.
+_LXML_TREE_CACHE: "WeakKeyDictionary[Any, Any]" = WeakKeyDictionary()
+
+
+def lxml_tree(soup: BeautifulSoup) -> Any:
+    """Return a cached lxml tree for *soup* (built once per soup)."""
+    tree = _LXML_TREE_CACHE.get(soup)
+    if tree is None:
+        from lxml import etree
+        tree = etree.fromstring(str(soup).encode(), etree.HTMLParser())
+        _LXML_TREE_CACHE[soup] = tree
+    return tree
 
 logger = logging.getLogger(__name__)
 
@@ -160,8 +177,16 @@ def extract_spa_state(soup: BeautifulSoup) -> dict[str, Any]:
     (__INITIAL_STATE__, __PRELOADED_STATE__, __REDUX_STATE__) patterns.
     Returns only keys that were found; malformed JSON is silently skipped.
     """
-    raw_html = str(soup)
-    if not any(m in raw_html for m in _SPA_MARKERS):
+    # Markers live either in a script's id (``<script id="__NEXT_DATA__">``) or in
+    # its text (``window.__NUXT__=``). Gate on the scripts alone instead of
+    # serialising the whole document with str(soup).
+    scripts = soup.find_all("script")
+    script_texts = [s.get_text() for s in scripts]
+    if not any(
+        m in ((s.get("id") or "") + t)
+        for s, t in zip(scripts, script_texts)
+        for m in _SPA_MARKERS
+    ):
         return {}
 
     result: dict[str, Any] = {}
@@ -181,8 +206,7 @@ def extract_spa_state(soup: BeautifulSoup) -> dict[str, Any]:
         "__PRELOADED_STATE__": "preloaded_state",
         "__REDUX_STATE__": "redux_state",
     }
-    for script in soup.find_all("script"):
-        text = script.get_text()
+    for text in script_texts:
         if not text:
             continue
         for marker, key in _var_map.items():

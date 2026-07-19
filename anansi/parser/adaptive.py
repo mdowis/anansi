@@ -31,6 +31,7 @@ from anansi.parser.strategies import (
     strategy_xpath_fallback,
 )
 from anansi.parser.structured import extract_all as _extract_structured
+from anansi.parser.structured import extract_jsonld, extract_opengraph, lxml_tree
 
 # JSON-LD property names that map directly to common scraping field names
 _JSONLD_FIELDS = frozenset({
@@ -142,14 +143,18 @@ class AdaptiveParser:
         # Structured data pre-pass — run once, not per field
         structured_values: dict[str, Any] = {}
         if use_structured:
-            sd = _extract_structured(soup)
-            for obj in sd["json_ld"]:
+            # Only JSON-LD and Open Graph feed selector fields; skip the microdata
+            # and SPA-state extraction (and their str(soup) work) that extract_all
+            # would also compute and that this path never reads.
+            json_ld = extract_jsonld(soup)
+            open_graph = extract_opengraph(soup)
+            for obj in json_ld:
                 for k, v in obj.items():
                     if not k.startswith("@") and k in _JSONLD_FIELDS and k not in structured_values:
                         structured_values[k] = v
             for field_name, og_key in _OG_ALIASES.items():
-                if field_name not in structured_values and og_key in sd["open_graph"]:
-                    structured_values[field_name] = sd["open_graph"][og_key]
+                if field_name not in structured_values and og_key in open_graph:
+                    structured_values[field_name] = open_graph[og_key]
 
         tasks = {
             f: self._extract_field(soup, f, cfg, url_pattern)
@@ -304,9 +309,8 @@ class AdaptiveParser:
             if stype == "css":
                 tags = soup.select(selector)
             elif stype == "xpath":
-                from lxml import etree
-                tree = etree.fromstring(str(soup).encode(), etree.HTMLParser())
-                lxml_els = tree.xpath(selector)
+                # Shared, once-parsed lxml tree (not a per-candidate re-parse).
+                lxml_els = lxml_tree(soup).xpath(selector)
                 # Convert lxml elements back to text
                 from lxml import etree as le
                 if cfg.multiple:
