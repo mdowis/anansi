@@ -721,9 +721,13 @@ class Crawler:
                     self._pages_fetched += 1
                     return
 
+                # Hash the page body once; reuse for the conditional-GET check,
+                # the url_cache update, and dedup below.
+                page_hash = hashlib.md5(result.html.encode()).hexdigest()
+
                 # Content hash check for 200 responses with no ETag support (E4)
                 if self._conditional_get and result.ok:
-                    new_hash = hashlib.md5(result.html.encode()).hexdigest()
+                    new_hash = page_hash
                     cached = await self._get_url_cache(url)
                     if cached and cached.get("content_hash") == new_hash:
                         self._unchanged_pages += 1
@@ -743,12 +747,12 @@ class Crawler:
                             url,
                             etag=result.headers.get("etag"),
                             last_modified=result.headers.get("last-modified"),
-                            content_hash=hashlib.md5(result.html.encode()).hexdigest(),
+                            content_hash=page_hash,
                         )
 
                 # Content deduplication (opt-in)
                 if self._deduplicate_content:
-                    content_hash = hashlib.md5(result.html.encode()).hexdigest()
+                    content_hash = page_hash
                     if await queue.is_content_seen(content_hash):
                         logger.debug("Duplicate content at %s — skipping", url)
                         await queue.mark_visited(url)
