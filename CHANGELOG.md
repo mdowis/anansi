@@ -4,6 +4,46 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-07-19
+
+Efficiency pass across the crawler, parser, fetchers, and MCP server (issues
+#12–#26). All changes are backward compatible; the minor bump reflects the new
+public helper methods added below.
+
+### Added
+
+- `Crawler.get_crawl(crawl_id)` and `Crawler.count_items(crawl_id)` — single-row /
+  `COUNT(*)` lookups that avoid scanning every crawl or loading every item.
+- `SQLiteQueue.push_batch(...)` — batched `(url, callback, priority, meta)` enqueue.
+- `AdaptiveParser.extract_with_structured(...)` — parse once, return both the
+  selector fields and the full structured payload.
+
+### Changed
+
+- **Crawler**: persistent per-page batching of link enqueue and item writes
+  (`executemany`); atomic single-statement `pop` (`UPDATE … RETURNING` with the
+  visited check folded in); `Response` memoizes its parsed BeautifulSoup/lxml
+  trees so `css()`/`xpath()`/`follow_links` parse once; page HTML hashed once;
+  `url_cache` read once per fetch; O(1) LRU for the per-domain throttle maps.
+- **Parser**: one shared lxml tree per document across XPath attempts and healing;
+  `extract()` skips unused microdata/SPA extraction; memoized fuzzy class matching;
+  assorted hot-path cleanups.
+- **Fetchers**: HTTP clients pooled per proxy and curl-cffi sessions reused across
+  requests/retries; browser context pool LRU-bounded; sitemap traversal reuses one
+  fetcher; `RobotsCache` gains per-origin single-flight and a bounded cache.
+- **MCP server**: `fetch_and_extract`/`extract` parse once; `export_crawl` and
+  `crawl_metrics` use the new single-row/count helpers and concurrent counts;
+  HTML→text/markdown conversion runs off the event loop (`asyncio.to_thread`).
+
+### Removed
+
+- Dead adaptive-concurrency bookkeeping (`_current_concurrency` / `_outcome_window`)
+  that was computed per fetch but never applied.
+
+### CI
+
+- Added a `concurrency` group so superseded workflow runs are cancelled.
+
 ## [1.0.1] - 2026-07-17
 
 ### Changed

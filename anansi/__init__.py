@@ -27,7 +27,7 @@ from anansi.protection import (
 )
 from anansi.proxy.manager import ProxyManager
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 __all__ = [
     "Crawler",
     "Spider",
