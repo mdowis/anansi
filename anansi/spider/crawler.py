@@ -20,7 +20,7 @@ import logging
 import random
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from enum import Enum
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -46,47 +46,39 @@ logger = logging.getLogger(__name__)
 _MAX_ROBOTS_CRAWL_DELAY = 300.0
 
 
-class _LRUDefault(dict):
+class _LRUDefault(OrderedDict):
     """A defaultdict-with-LRU-eviction. Missing-key reads insert the default
     factory's value; every access promotes the entry; the dict caps at
     ``max_entries`` and drops the least-recently-used.
+
+    Ordering is kept by the underlying ``OrderedDict`` so promotion is O(1)
+    (``move_to_end``) and eviction is O(1) (``popitem(last=False)``) — no linear
+    scan per access.
     """
 
     def __init__(self, default_factory, *, max_entries: int) -> None:
         super().__init__()
         self._factory = default_factory
         self._max = max_entries
-        self._order: deque = deque()
 
     def __missing__(self, key):
         value = self._factory()
         # Insert via __setitem__ so eviction logic runs.
-        self.__setitem__(key, value)
+        self[key] = value
         return value
 
     def __getitem__(self, key):
         if super().__contains__(key):
             # Promote to most-recently-used.
-            try:
-                self._order.remove(key)
-            except ValueError:
-                pass
-            self._order.append(key)
+            self.move_to_end(key)
             return super().__getitem__(key)
         return self.__missing__(key)
 
     def __setitem__(self, key, value) -> None:
-        existed = super().__contains__(key)
         super().__setitem__(key, value)
-        if existed:
-            try:
-                self._order.remove(key)
-            except ValueError:
-                pass
-        self._order.append(key)
-        while len(self._order) > self._max:
-            oldest = self._order.popleft()
-            super().pop(oldest, None)
+        self.move_to_end(key)
+        while len(self) > self._max:
+            self.popitem(last=False)
 
     def get(self, key, default=None):  # type: ignore[override]
         if super().__contains__(key):
