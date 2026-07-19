@@ -371,6 +371,10 @@ class BrowserFetcher(BaseFetcher):
         self._lock = asyncio.Lock()
 
     async def _ensure_browser(self) -> None:
+        # Lock-free fast path: the browser is launched once and not torn down
+        # mid-life, so the common "already up" case skips acquiring the lock.
+        if self._browser is not None:
+            return
         async with self._lock:
             if self._browser is not None:
                 return
@@ -522,14 +526,12 @@ class BrowserFetcher(BaseFetcher):
             # session is intentionally NOT cleared — that earned state (e.g. a
             # solved cf_clearance) is the whole point of keeping it.
             if not sticky:
-                try:
-                    await ctx.clear_cookies()
-                except Exception:
-                    pass
-                try:
-                    await ctx.clear_permissions()
-                except Exception:
-                    pass
+                # Two independent round-trips to the browser — clear concurrently.
+                await asyncio.gather(
+                    ctx.clear_cookies(),
+                    ctx.clear_permissions(),
+                    return_exceptions=True,
+                )
 
             poisoned = False
             try:
@@ -952,11 +954,18 @@ class BrowserFetcher(BaseFetcher):
                             for c in await ctx.cookies()
                         }
 
-                        # Read captured response bodies after all navigation is done.
+                        # Read captured response bodies after navigation is done.
+                        # The reads are independent round-trips, so fetch them
+                        # concurrently (bounded by the 50-entry capture cap).
                         captured_requests: list[dict[str, Any]] = []
-                        for captured_resp in _captured_resp_objects:
+                        _bodies = await asyncio.gather(
+                            *(cr.body() for cr in _captured_resp_objects),
+                            return_exceptions=True,
+                        )
+                        for captured_resp, body_bytes in zip(_captured_resp_objects, _bodies):
+                            if isinstance(body_bytes, BaseException):
+                                continue
                             try:
-                                body_bytes = await captured_resp.body()
                                 if len(body_bytes) > 200 * 1024:
                                     continue
                                 captured_requests.append({

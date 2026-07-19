@@ -371,11 +371,13 @@ class HTTPFetcher(BaseFetcher):
         for name, value in resp.cookies.items():
             self._session_cookies[name] = value
 
-        body_text = resp.text
-        if len(body_text.encode("utf-8", errors="ignore")) > self._max_response_bytes:
+        # Measure the raw downloaded bytes (already materialised) instead of
+        # re-encoding the decoded text into a second full copy just to size it.
+        if len(resp.content) > self._max_response_bytes:
             raise ResponseTooLargeError(
                 f"response body exceeds cap {self._max_response_bytes}"
             )
+        body_text = resp.text
         _spa = _extract_spa(body_text)
         return FetchResult(
             url=str(resp.url),
@@ -478,11 +480,12 @@ class HTTPFetcher(BaseFetcher):
                 for name, value in resp.cookies.items():
                     self._client.cookies.set(name, value)
 
-            body_text = resp.text
-            if len(body_text.encode("utf-8", errors="ignore")) > self._max_response_bytes:
+            # Measure raw downloaded bytes instead of re-encoding decoded text.
+            if len(resp.content) > self._max_response_bytes:
                 raise ResponseTooLargeError(
                     f"response body exceeds cap {self._max_response_bytes}"
                 )
+            body_text = resp.text
             _spa = _extract_spa(body_text)
             return FetchResult(
                 url=str(resp.url),
