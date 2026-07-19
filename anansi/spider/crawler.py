@@ -654,7 +654,15 @@ class Crawler:
                     self._proxy_manager.next(domain=domain)
                     if self._proxy_manager else None
                 )
-                result = await self._do_fetch(url, proxy=proxy, meta=meta)
+                # Read the url_cache row once: _do_fetch uses it for conditional-
+                # GET headers and the content-hash check below reuses it (nothing
+                # updates the row in between).
+                url_cache_row = (
+                    await self._get_url_cache(url) if self._conditional_get else None
+                )
+                result = await self._do_fetch(
+                    url, proxy=proxy, meta=meta, cached=url_cache_row
+                )
 
                 # Attribute the outcome to the detected vendor (set by _do_fetch)
                 # so future selections learn which proxies beat which vendors.
@@ -728,7 +736,7 @@ class Crawler:
                 # Content hash check for 200 responses with no ETag support (E4)
                 if self._conditional_get and result.ok:
                     new_hash = page_hash
-                    cached = await self._get_url_cache(url)
+                    cached = url_cache_row  # reuse the row read before the fetch
                     if cached and cached.get("content_hash") == new_hash:
                         self._unchanged_pages += 1
                         logger.debug("Content hash unchanged: %s", url)
@@ -941,7 +949,12 @@ class Crawler:
         fetcher._session_cookies.update(cookies)
 
     async def _do_fetch(
-        self, url: str, *, proxy: str | None, meta: dict[str, Any]
+        self,
+        url: str,
+        *,
+        proxy: str | None,
+        meta: dict[str, Any],
+        cached: dict[str, Any] | None = None,
     ) -> FetchResult:
         use_browser = meta.get("use_browser", False)
 
@@ -972,13 +985,11 @@ class Crawler:
         extra_headers: dict[str, str] = (
             dict(self._auth_headers) if self._auth_headers and in_scope else {}
         )
-        if self._conditional_get:
-            cached = await self._get_url_cache(url)
-            if cached:
-                if cached.get("etag"):
-                    extra_headers["If-None-Match"] = cached["etag"]
-                if cached.get("last_modified"):
-                    extra_headers["If-Modified-Since"] = cached["last_modified"]
+        if self._conditional_get and cached:
+            if cached.get("etag"):
+                extra_headers["If-None-Match"] = cached["etag"]
+            if cached.get("last_modified"):
+                extra_headers["If-Modified-Since"] = cached["last_modified"]
 
         cookies_for_request = self._cookies if in_scope else {}
         if self._fetcher is not None:
