@@ -326,7 +326,7 @@ class AdaptiveParser:
                 return None
 
             if cfg.multiple:
-                return [_extract_from_tag(t, cfg.attribute) for t in tags if _extract_from_tag(t, cfg.attribute)]
+                return [v for t in tags if (v := _extract_from_tag(t, cfg.attribute))]
 
             return _extract_from_tag(tags[0], cfg.attribute)
         except Exception:

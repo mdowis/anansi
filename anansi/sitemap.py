@@ -190,31 +190,34 @@ async def _parse_sitemap(
             except Exception:
                 continue
     else:
-        # Extract all <url> blocks and parse metadata from each
-        url_blocks = re.findall(r"<url>(.*?)</url>", xml, re.DOTALL)
-        if url_blocks:
-            for block in url_blocks:
-                loc_match = re.search(r"<loc>\s*(.*?)\s*</loc>", block)
-                if not loc_match:
-                    continue
-                url = loc_match.group(1).strip()
+        # Stream each <url> block instead of materialising every block of a
+        # (up to 50 MB) sitemap as a list before iterating.
+        found_any = False
+        for m in re.finditer(r"<url>(.*?)</url>", xml, re.DOTALL):
+            found_any = True
+            block = m.group(1)
+            loc_match = re.search(r"<loc>\s*(.*?)\s*</loc>", block)
+            if not loc_match:
+                continue
+            url = loc_match.group(1).strip()
 
-                lastmod_match = re.search(r"<lastmod>\s*(.*?)\s*</lastmod>", block)
-                lastmod = _parse_lastmod(lastmod_match.group(1)) if lastmod_match else None
+            lastmod_match = re.search(r"<lastmod>\s*(.*?)\s*</lastmod>", block)
+            lastmod = _parse_lastmod(lastmod_match.group(1)) if lastmod_match else None
 
-                changefreq_match = re.search(r"<changefreq>\s*(.*?)\s*</changefreq>", block)
-                changefreq = changefreq_match.group(1).strip() if changefreq_match else None
+            changefreq_match = re.search(r"<changefreq>\s*(.*?)\s*</changefreq>", block)
+            changefreq = changefreq_match.group(1).strip() if changefreq_match else None
 
-                priority_match = re.search(r"<priority>\s*(.*?)\s*</priority>", block)
-                priority: float | None = None
-                if priority_match:
-                    try:
-                        priority = float(priority_match.group(1))
-                    except ValueError:
-                        pass
+            priority_match = re.search(r"<priority>\s*(.*?)\s*</priority>", block)
+            priority: float | None = None
+            if priority_match:
+                try:
+                    priority = float(priority_match.group(1))
+                except ValueError:
+                    pass
 
-                yield SitemapEntry(url=url, lastmod=lastmod, changefreq=changefreq, priority=priority)
-        else:
+            yield SitemapEntry(url=url, lastmod=lastmod, changefreq=changefreq, priority=priority)
+
+        if not found_any:
             # Fallback: sitemap without <url> wrappers — extract bare <loc> tags
-            for url in re.findall(r"<loc>\s*(.*?)\s*</loc>", xml):
-                yield SitemapEntry(url=url.strip(), lastmod=None)
+            for m in re.finditer(r"<loc>\s*(.*?)\s*</loc>", xml):
+                yield SitemapEntry(url=m.group(1).strip(), lastmod=None)

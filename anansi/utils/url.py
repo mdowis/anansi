@@ -105,7 +105,11 @@ def canonicalize_url(
         path = path.rstrip("/")
 
     # Filter and sort query parameters
-    strip = _TRACKING_PARAMS | frozenset(extra_strip_params)
+    strip = (
+        _TRACKING_PARAMS
+        if not extra_strip_params
+        else _TRACKING_PARAMS | frozenset(extra_strip_params)
+    )
     params = [
         (k, v)
         for k, v in parse_qsl(parsed.query, keep_blank_values=True)

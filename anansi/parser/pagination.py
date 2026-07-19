@@ -30,6 +30,9 @@ def detect_next_page_url(html: str, base_url: str) -> str | None:
     from bs4 import BeautifulSoup
 
     soup = BeautifulSoup(html, "lxml")
+    # Scan all anchors once — heuristics 3, 4, and 5 below reuse this list
+    # instead of re-walking the tree with find_all("a", href=True) each time.
+    anchors = soup.find_all("a", href=True)
 
     # 1. <link rel="next">
     link_tag = soup.find(
@@ -53,7 +56,7 @@ def detect_next_page_url(html: str, base_url: str) -> str | None:
             return url
 
     # 3. Anchor text matches next-page patterns
-    for a in soup.find_all("a", href=True):
+    for a in anchors:
         text = a.get_text(strip=True)
         if _NEXT_TEXT_RE.match(text):
             url = urljoin(base_url, str(a["href"]))
@@ -61,7 +64,7 @@ def detect_next_page_url(html: str, base_url: str) -> str | None:
                 return url
 
     # 4. Anchor class or id contains "next"
-    for a in soup.find_all("a", href=True):
+    for a in anchors:
         classes = " ".join(a.get("class", []))
         aid = a.get("id", "")
         if _NEXT_CLASS_RE.search(classes) or _NEXT_CLASS_RE.search(aid):
@@ -80,7 +83,7 @@ def detect_next_page_url(html: str, base_url: str) -> str | None:
             current_page = None
         if current_page is not None:
             next_str = str(current_page + 1)
-            for a in soup.find_all("a", href=True):
+            for a in anchors:
                 candidate = urljoin(base_url, str(a["href"]))
                 cqs = parse_qs(urlparse(candidate).query)
                 if cqs.get(page_param, [None])[0] == next_str:

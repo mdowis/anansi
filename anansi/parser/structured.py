@@ -78,67 +78,75 @@ def extract_microdata(soup: BeautifulSoup) -> list[dict[str, Any]]:
     multiple times under one scope, values are collected into a list.
     """
 
+    def _prop_value(el: Tag) -> Any:
+        if el.has_attr("itemscope"):
+            return _collect_item(el)
+        if el.name in ("a", "link") and el.get("href"):
+            return el["href"]
+        if el.name in ("img", "audio", "video", "source") and el.get("src"):
+            return el["src"]
+        if el.name == "meta" and el.get("content") is not None:
+            return el["content"]
+        if el.name == "time" and el.get("datetime"):
+            return el["datetime"]
+        return el.get_text(separator=" ", strip=True)
+
+    def _add(item: dict[str, Any], name: str, value: Any) -> None:
+        if name in item:
+            existing = item[name]
+            if isinstance(existing, list):
+                existing.append(value)
+            else:
+                item[name] = [existing, value]
+        else:
+            item[name] = value
+
     def _collect_item(root: Tag) -> dict[str, Any]:
         item: dict[str, Any] = {}
         item_type = root.get("itemtype", "")
         if item_type:
             item["@type"] = item_type
 
-        for el in root.find_all(itemprop=True):
-            # Skip elements nested inside a child itemscope
-            parent = el.parent
-            inside_nested = False
-            while parent and parent is not root:
-                if isinstance(parent, Tag) and parent.has_attr("itemscope"):
-                    inside_nested = True
-                    break
-                parent = parent.parent
-            if inside_nested:
-                continue
-
-            prop_name = el.get("itemprop", "").strip()
-            if not prop_name:
-                continue
-
-            if el.has_attr("itemscope"):
-                value: Any = _collect_item(el)
-            elif el.name in ("a", "link") and el.get("href"):
-                value = el["href"]
-            elif el.name in ("img", "audio", "video", "source") and el.get("src"):
-                value = el["src"]
-            elif el.name == "meta" and el.get("content") is not None:
-                value = el["content"]
-            elif el.name == "time" and el.get("datetime"):
-                value = el["datetime"]
-            else:
-                value = el.get_text(separator=" ", strip=True)
-
-            if prop_name in item:
-                existing = item[prop_name]
-                if isinstance(existing, list):
-                    existing.append(value)
+        # Single descent over the subtree instead of ``find_all(itemprop=True)``
+        # plus an O(depth) ancestor walk per hit: recurse into a nested itemscope
+        # only through its own sub-item (its props don't belong to this scope).
+        def _walk(node: Tag) -> None:
+            for child in node.children:
+                if not isinstance(child, Tag):
+                    continue
+                has_prop = child.has_attr("itemprop")
+                has_scope = child.has_attr("itemscope")
+                if has_prop:
+                    prop_name = child.get("itemprop", "").strip()
+                    if prop_name:
+                        _add(item, prop_name, _prop_value(child))
+                    # A nested scope's inner props belong to the sub-item, so only
+                    # keep descending when this itemprop is not itself a scope.
+                    if not has_scope:
+                        _walk(child)
+                elif has_scope:
+                    # Nested scope with no itemprop is a separate item; skip it.
+                    continue
                 else:
-                    item[prop_name] = [existing, value]
-            else:
-                item[prop_name] = value
+                    _walk(child)
 
+        _walk(root)
         return item
 
     results: list[dict[str, Any]] = []
-    for el in soup.find_all(itemscope=True):
-        if not isinstance(el, Tag):
-            continue
-        # Only process top-level itemscope elements
-        parent = el.parent
-        inside_another = False
-        while parent and getattr(parent, "name", None) not in ("html", "[document]", None):
-            if isinstance(parent, Tag) and parent.has_attr("itemscope"):
-                inside_another = True
-                break
-            parent = parent.parent
-        if not inside_another:
-            results.append(_collect_item(el))
 
+    # Collect only top-level itemscopes (those with no itemscope ancestor) by
+    # descending from the root and stopping at the first scope on each branch.
+    def _find_top(node: Tag) -> None:
+        for child in node.children:
+            if not isinstance(child, Tag):
+                continue
+            if child.has_attr("itemscope"):
+                results.append(_collect_item(child))
+            else:
+                _find_top(child)
+
+    _find_top(soup)
     return results
 
 
