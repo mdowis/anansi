@@ -374,8 +374,6 @@ class Crawler:
         self._valid_items = 0
         self._invalid_items = 0
         # Adaptive concurrency: sliding window of last 50 outcomes (True = error)
-        self._outcome_window: deque = deque(maxlen=50)
-        self._current_concurrency = concurrency
         self._robots: Any | None = None
         if respect_robots:
             from anansi.robots import RobotsCache
@@ -699,24 +697,6 @@ class Crawler:
                 elif result.status >= 500 or result.status == 0:
                     await self._circuit_breaker.record_failure(url)
 
-                # Adaptive concurrency: track error rate over last 50 fetches
-                is_error = not result.ok and result.status not in (301, 302, 304)
-                self._outcome_window.append(is_error)
-                if len(self._outcome_window) >= 20:
-                    error_rate = sum(self._outcome_window) / len(self._outcome_window)
-                    if error_rate > 0.40 and self._current_concurrency > 1:
-                        self._current_concurrency -= 1
-                        logger.info(
-                            "Adaptive concurrency: high error rate %.0f%% — reducing to %d",
-                            error_rate * 100, self._current_concurrency,
-                        )
-                    elif error_rate < 0.10 and self._current_concurrency < self._concurrency:
-                        self._current_concurrency += 1
-                        logger.debug(
-                            "Adaptive concurrency: low error rate %.0f%% — restoring to %d",
-                            error_rate * 100, self._current_concurrency,
-                        )
-
                 # Adaptive rate limiting: record outcome for this domain (E2)
                 await self._domain_throttle.record_result(url, result.status)
 
@@ -830,14 +810,12 @@ class Crawler:
                 logger.warning("Worker timed out after %.0fs for %s", self._worker_timeout, url)
                 await queue.increment_retry(url, self._max_url_retries)
                 await self._circuit_breaker.record_failure(url)
-                self._outcome_window.append(True)
                 if self._proxy_manager and proxy:
                     self._proxy_manager.report_failure(proxy)
             except Exception as exc:
                 logger.exception("Error fetching %s: %s", url, exc)
                 await queue.increment_retry(url, self._max_url_retries)
                 await self._circuit_breaker.record_failure(url)
-                self._outcome_window.append(True)
                 if self._proxy_manager and proxy:
                     self._proxy_manager.report_failure(proxy)
 
